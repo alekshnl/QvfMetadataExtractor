@@ -1,6 +1,6 @@
-# QVF Metadata Extractor
+# QVF Metadata And Table Extractor
 
-🧩 A focused utility for reading Qlik `.qvf` files directly and packaging the discovered metadata into a downloadable ZIP archive.
+🧩 A focused utility for reading Qlik `.qvf` files directly and packaging the discovered metadata and reconstructed tables into a downloadable ZIP archive.
 
 The project now follows a host-native approach:
 
@@ -30,11 +30,17 @@ The ZIP result is designed to be useful for both human inspection and follow-up 
 - `data-model.json`
 - `load-model.json`
 - `color-maps.json`
+- `tables/_manifest.json`
+- `tables/_confidence.json`
+- `tables/<table>.parquet`
+- `tables/<table>.tsv`
 - `summary.txt`
 - `raw/blocks.jsonl`
 - `raw/decoded-objects.jsonl`
+- `raw/non-scalar-streams.json`
 - `raw/string-findings.txt`
 - `raw/unknown-blocks.json`
+- `raw/table-block-mapping.json`
 
 ## 🔄 Processing Flow
 
@@ -45,9 +51,10 @@ When a `.qvf` file is uploaded, the application performs the following workflow:
 3. The extractor scans the QVF structure for `gzjson` and binary records.
 4. Structured payloads are decoded into JSON output files.
 5. The load script is extracted and saved as `script.qvs`.
-6. Embedded media items are exported when they can be cleanly bounded.
-7. A ZIP archive is created and returned to the browser.
-8. After processing, the uploaded file and temporary extraction folder are removed.
+6. Reconstructed tables are written as `Parquet` and `TSV`, with confidence markers and source-block provenance.
+7. Embedded media items are exported when they can be cleanly bounded.
+8. A ZIP archive is created and returned to the browser.
+9. After processing, the uploaded file and temporary extraction folder are removed.
 
 Version 1 processes one upload at a time. If another extraction is already running, the service returns a busy response instead of running jobs in parallel.
 
@@ -64,6 +71,8 @@ The repository contains two cooperating parts:
   - parses the QVF file directly
   - decodes structured payload blocks
   - writes normalized metadata files
+  - attempts best-effort row and lookup table reconstruction
+  - exports tables as `Parquet` and `TSV`
   - creates the downloadable ZIP archive
 
 This keeps the web layer small and makes the extractor reusable as a standalone CLI tool.
@@ -81,20 +90,28 @@ The page is intentionally compact and task-oriented. It includes:
 - live upload and processing status
 - an English explanation of the file lifecycle
 - an English summary of the runtime components
+- output that now includes reconstructed tables and confidence reports
 
 ## 🐍 Running The Extractor Directly
 
 The Python extractor can also be run without the web UI, which makes local analysis on macOS or Linux straightforward as long as Python 3 is available.
 
+Install the Python dependency first:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
 Example:
 
 ```bash
-python3 scripts/extract_qvf.py "Asset Management.qvf" \
+.venv/bin/python scripts/extract_qvf.py "Asset Management.qvf" \
   --output-dir artifacts/output/asset-management \
   --zip artifacts/output/asset-management.zip
 ```
 
-This creates the extracted metadata folder and a matching ZIP archive.
+This creates the extracted metadata folder, table exports, and a matching ZIP archive.
 
 ## 🚀 Installation And Startup
 
@@ -110,7 +127,8 @@ The script:
 
 - installs base packages on Ubuntu if needed
 - installs Node.js if it is missing or too old
-- verifies Python availability
+- creates a local Python virtual environment
+- installs Python requirements from `requirements.txt`
 - installs npm dependencies
 - creates runtime folders
 - starts the web application on port `5165`
@@ -148,6 +166,8 @@ EXTRACTOR_SCRIPT=./scripts/extract_qvf.py
 KEEP_FAILED_JOBS=false
 ```
 
+The Python dependency list lives in `requirements.txt`. The current extractor uses `pyarrow` for Parquet output.
+
 ## 🗂️ Temporary Data And Cleanup
 
 Runtime data is stored under `runtime/` and is not meant for source control.
@@ -172,7 +192,9 @@ The extractor is designed to be transparent about what it can and cannot decode.
 That means the output intentionally contains both:
 
 - normalized metadata files such as `sheets.json`, `measures.json`, and `script.qvs`
-- raw evidence files such as `raw/decoded-objects.jsonl` and `raw/unknown-blocks.json`
+- reconstructed table files under `tables/`
+- confidence files such as `tables/_confidence.json`
+- raw evidence files such as `raw/decoded-objects.jsonl`, `raw/non-scalar-streams.json`, `raw/unknown-blocks.json`, and `raw/table-block-mapping.json`
 
 This makes it easier to extend the parser over time without losing traceability back to the original file structure.
 
@@ -180,7 +202,7 @@ This makes it easier to extend the parser over time without losing traceability 
 
 This project does **not** claim to be a drop-in replacement for `qlik app unbuild`.
 
-Instead, it provides a Linux- and macOS-friendly extraction path that works by analyzing the QVF file structure directly. Many modern QVF files expose rich structured metadata this way, but some binary blocks remain opaque and are explicitly listed as such in the output.
+Instead, it provides a Linux- and macOS-friendly extraction path that works by analyzing the QVF file structure directly. Many modern QVF files expose rich structured metadata this way, and some tables can be reconstructed exactly or partially, but other binary blocks remain opaque and are explicitly listed as such in the output.
 
 ## 📌 Operational Notes
 
@@ -196,5 +218,7 @@ This repository provides a controlled way to:
 - upload a Qlik app
 - decode as much metadata as possible directly from the `.qvf`
 - keep the load script as a real `.qvs` file
+- export reconstructed model tables as `Parquet` and `TSV`
+- tell you which table columns are exact, heuristic, partial, or still missing
 - download the result as a ZIP package
 - clean up temporary server-side files automatically

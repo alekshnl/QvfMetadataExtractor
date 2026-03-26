@@ -1,5 +1,6 @@
 const form = document.getElementById('upload-form');
 const fileInput = document.getElementById('qvf-file');
+const includeTablesInput = document.getElementById('include-tables');
 const submitButton = document.getElementById('submit-button');
 const statusElement = document.getElementById('status');
 const errorElement = document.getElementById('error-message');
@@ -54,6 +55,7 @@ form.addEventListener('submit', async (event) => {
     setStatus('Uploading file', 'busy');
     const formData = new FormData();
     formData.append('qvf', file);
+    formData.append('includeTables', includeTablesInput.checked ? 'true' : 'false');
 
     const response = await fetch('/api/extract', {
       method: 'POST',
@@ -70,7 +72,7 @@ form.addEventListener('submit', async (event) => {
     const blob = await response.blob();
     const disposition = response.headers.get('Content-Disposition') || '';
     const match = disposition.match(/filename="?([^";]+)"?/i);
-    const filename = match ? match[1] : 'metadata.zip';
+    const filename = match ? match[1] : 'qvf-extract.zip';
 
     await triggerDownload(blob, filename);
     setStatus('Download started', 'success');

@@ -105,10 +105,15 @@ async function writeFailureReport(jobDir, details) {
   await fsp.writeFile(reportPath, `${lines.join('\n')}\n`, 'utf8');
 }
 
-async function runExtractor(inputFile, extractDir, zipPath) {
+async function runExtractor(inputFile, extractDir, zipPath, includeTables) {
+  const args = [extractorScript, inputFile, '--output-dir', extractDir, '--zip', zipPath];
+  if (!includeTables) {
+    args.push('--skip-tables');
+  }
+
   return execFileAsync(
     pythonBin,
-    [extractorScript, inputFile, '--output-dir', extractDir, '--zip', zipPath],
+    args,
     {
       cwd: rootDir,
       maxBuffer: 20 * 1024 * 1024,
@@ -139,7 +144,7 @@ function createJobPaths(jobId, originalName) {
   const extractDir = path.join(jobDir, 'extract');
   const resultDir = path.join(jobDir, 'result');
   const uploadedFile = path.join(uploadDir, `${baseName}.qvf`);
-  const zipPath = path.join(resultDir, `${baseName}-metadata.zip`);
+  const zipPath = path.join(resultDir, `${baseName}-extract.zip`);
 
   return {
     baseName,
@@ -209,6 +214,7 @@ app.post('/api/extract', uploadMiddleware, async (req, res) => {
   }
 
   const jobId = crypto.randomUUID();
+  const includeTables = String(req.body?.includeTables ?? 'true').toLowerCase() !== 'false';
   const paths = createJobPaths(jobId, req.file.originalname);
   let extractorStdout = '';
   let extractorStderr = '';
@@ -222,7 +228,7 @@ app.post('/api/extract', uploadMiddleware, async (req, res) => {
     await prepareJobDirectories(paths);
     await fsp.rename(req.file.path, paths.uploadedFile);
 
-    const result = await runExtractor(paths.uploadedFile, paths.extractDir, paths.zipPath);
+    const result = await runExtractor(paths.uploadedFile, paths.extractDir, paths.zipPath, includeTables);
     extractorStdout = (result.stdout || '').trim();
     extractorStderr = (result.stderr || '').trim();
 
@@ -239,6 +245,7 @@ app.post('/api/extract', uploadMiddleware, async (req, res) => {
       uploadedFile: paths.uploadedFile,
       extractDir: paths.extractDir,
       zipPath: paths.zipPath,
+      includeTables,
       pythonBin,
       extractorScript,
       stdout: extractorStdout,

@@ -3,53 +3,37 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>QVF Metadata Extractor</title>
+    <title>QVF Metadata And Table Extractor</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <main class="shell">
-      <section class="hero panel">
-        <div class="hero-copy">
-          <p class="eyebrow">QVF Structure Analysis</p>
-          <h1>Upload a QVF file and download its extracted metadata package.</h1>
-          <p class="lede">
-            This service reads the QVF file directly, decodes structured metadata blocks where possible, extracts the
-            load script as a <code>.qvs</code> file, and returns the result as a ZIP archive.
-          </p>
+      <section class="tool panel">
+        <div class="tool-header">
+          <p class="eyebrow">QVF Extractor</p>
+          <h1>Extract metadata from a QVF file.</h1>
+          <p class="lede">Upload a file, choose whether table exports should be included, and download a ZIP result.</p>
         </div>
         <form id="upload-form" class="upload-card" novalidate>
           <label class="upload-label" for="qvf-file">QVF file</label>
           <input id="qvf-file" name="qvf" type="file" accept=".qvf" required />
-          <p class="upload-hint">Supported format: <strong>.qvf</strong></p>
-          <button id="submit-button" type="submit">Extract metadata</button>
+          <label class="toggle" for="include-tables">
+            <input id="include-tables" name="includeTables" type="checkbox" value="true" checked />
+            <span>Include data tables in the ZIP</span>
+          </label>
+          <p class="upload-hint">Supports <strong>.qvf</strong> input and returns a ZIP download.</p>
+          <button id="submit-button" type="submit">Extract metadata and tables</button>
           <div id="status" class="status idle" aria-live="polite">Ready for upload</div>
           <p id="error-message" class="error-message" hidden></p>
         </form>
       </section>
 
-      <section class="panel grid-two">
-        <div>
-          <h2>What happens to your app?</h2>
-          <ol class="steps">
-            <li>The uploaded <code>.qvf</code> file is written to a temporary folder on the server.</li>
-            <li>A Python extractor scans the QVF structure for metadata records, scripts, variables, data sources, and embedded assets.</li>
-            <li>Structured findings are written into JSON files, the load script is saved as <code>script.qvs</code>, and raw evidence files are added for traceability.</li>
-            <li>The extracted output is packaged into a ZIP file and sent back to your browser as a download.</li>
-            <li>After processing, the uploaded file and temporary extraction folder are deleted from the server.</li>
-          </ol>
-        </div>
-        <div>
-          <h2>Technology used</h2>
-          <ul class="tech-list">
-            <li><span>Node.js</span><small>Application runtime for the web service</small></li>
-            <li><span>Express</span><small>HTTP server and static file delivery</small></li>
-            <li><span>Multer</span><small>Temporary file upload handling</small></li>
-            <li><span>Python 3</span><small>Extractor runtime for QVF analysis and ZIP generation</small></li>
-            <li><span>zlib + JSON</span><small>Decoding of structured payload blocks found inside the QVF</small></li>
-            <li><span>zipfile</span><small>Packaging of the metadata result for download</small></li>
-            <li><span>No Docker runtime</span><small>The extraction path runs directly on the host without Qlik Core</small></li>
-          </ul>
-        </div>
+      <section class="note panel">
+        <h2>Process</h2>
+        <p>
+          The uploaded file is processed in a temporary folder, the ZIP is returned to your browser, and the temporary
+          files are removed after processing. The load script is included as <code>script.qvs</code>.
+        </p>
       </section>
     </main>
 

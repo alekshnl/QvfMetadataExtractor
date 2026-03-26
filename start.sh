@@ -12,6 +12,8 @@ JOB_TTL_MINUTES=${JOB_TTL_MINUTES:-30}
 KEEP_FAILED_JOBS=${KEEP_FAILED_JOBS:-false}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 EXTRACTOR_SCRIPT=${EXTRACTOR_SCRIPT:-./scripts/extract_qvf.py}
+VENV_DIR=${VENV_DIR:-$ROOT_DIR/.venv}
+REQUIREMENTS_FILE=${REQUIREMENTS_FILE:-$ROOT_DIR/requirements.txt}
 APP_PID_FILE="$ROOT_DIR/runtime/pids/web.pid"
 APP_LOG_FILE="$ROOT_DIR/runtime/logs/web.log"
 
@@ -54,7 +56,7 @@ install_node_ubuntu() {
   run_sudo apt-get install -y nodejs
 }
 
-verify_mac_dependencies() {
+verify_local_dependencies() {
   command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
     log "Python is required. Set PYTHON_BIN if needed."
     exit 1
@@ -86,16 +88,35 @@ stop_existing_app() {
   fi
 }
 
-install_dependencies() {
+install_npm_dependencies() {
   log "Installing npm dependencies."
   npm ci
 }
 
-verify_extractor() {
+prepare_python_env() {
   command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
     log "Python executable not found: $PYTHON_BIN"
     exit 1
   }
+
+  if [[ ! -d "$VENV_DIR" ]]; then
+    log "Creating Python virtual environment in $VENV_DIR."
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
+  fi
+
+  local venv_python="$VENV_DIR/bin/python"
+  local venv_pip="$VENV_DIR/bin/pip"
+
+  log "Installing Python requirements."
+  "$venv_python" -m pip install --upgrade pip >/dev/null
+  if [[ -f "$REQUIREMENTS_FILE" ]]; then
+    "$venv_pip" install -r "$REQUIREMENTS_FILE" >/dev/null
+  fi
+
+  PYTHON_BIN="$venv_python"
+}
+
+verify_extractor() {
   [[ -f "$EXTRACTOR_SCRIPT" ]] || {
     log "Extractor script not found: $EXTRACTOR_SCRIPT"
     exit 1
@@ -121,13 +142,14 @@ if is_ubuntu; then
   install_base_packages_ubuntu
   install_node_ubuntu
 else
-  verify_mac_dependencies
+  verify_local_dependencies
 fi
 
+prepare_python_env
 verify_extractor
 prepare_runtime
 stop_existing_app
-install_dependencies
+install_npm_dependencies
 start_web_app
 
 cat <<EOF
@@ -138,5 +160,6 @@ Web UI:  http://<server-ip>:${PORT}
 Health:  http://<server-ip>:${PORT}/healthz
 Logs:    ${APP_LOG_FILE}
 PID:     $(cat "$APP_PID_FILE")
+Python:  ${PYTHON_BIN}
 
 EOF
