@@ -110,6 +110,17 @@ async function runQlik(args) {
   };
 }
 
+function explainQlikError(error, args) {
+  const stderr = (error.stderr || '').trim();
+  const command = args.join(' ');
+
+  if (command.includes('app import') && stderr.includes('500 Internal Error')) {
+    return 'The Qlik engine returned a generic import error. This usually means the engine container cannot read the uploaded QVF path from the host runtime folder.';
+  }
+
+  return stderr || error.message;
+}
+
 function buildEngineArgs(commandArgs) {
   return [...commandArgs, '--server', engineUrl, '--server-type', 'engine'];
 }
@@ -244,6 +255,7 @@ app.post('/api/extract', uploadMiddleware, async (req, res) => {
   const paths = createJobPaths(jobId, req.file.originalname);
   const appName = `${paths.baseName}-${jobId.slice(0, 8)}`;
   let appId = null;
+  let lastQlikArgs = null;
 
   activeJobId = jobId;
 
@@ -251,14 +263,14 @@ app.post('/api/extract', uploadMiddleware, async (req, res) => {
     await prepareJobDirectories(paths);
     await fsp.rename(req.file.path, paths.uploadedFile);
 
-    const importResult = await runQlik(
-      buildEngineArgs(['app', 'import', '--quiet', '--name', appName, '--file', paths.uploadedFile])
-    );
+    lastQlikArgs = buildEngineArgs(['app', 'import', '--quiet', '--name', appName, '--file', paths.uploadedFile]);
+    const importResult = await runQlik(lastQlikArgs);
     appId = parseImportedAppId(importResult.stdout);
 
     await safeUnlink(paths.uploadedFile);
 
-    await runQlik(buildEngineArgs(['app', 'unbuild', '-a', appId, '--dir', paths.extractDir]));
+    lastQlikArgs = buildEngineArgs(['app', 'unbuild', '-a', appId, '--dir', paths.extractDir]);
+    await runQlik(lastQlikArgs);
 
     await zipDirectory(paths.extractDir, paths.zipPath);
     await sendDownload(res, paths.zipPath, path.basename(paths.zipPath));
@@ -267,7 +279,7 @@ app.post('/api/extract', uploadMiddleware, async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({
         error: 'The QVF file could not be processed.',
-        details: error.stderr || error.message,
+        details: explainQlikError(error, lastQlikArgs || []),
       });
     }
   } finally {

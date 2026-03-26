@@ -15,9 +15,20 @@ JOB_TTL_MINUTES=${JOB_TTL_MINUTES:-30}
 QLIK_BIN=${QLIK_BIN:-./bin/qlik}
 ENGINE_CONTAINER_NAME=${ENGINE_CONTAINER_NAME:-qlik-engine}
 ENGINE_DOCS_DIR=${ENGINE_DOCS_DIR:-$ROOT_DIR/runtime/engine-docs}
+resolve_path() {
+  local value=$1
+  if [[ "$value" = /* ]]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s/%s\n' "$ROOT_DIR" "${value#./}"
+  fi
+}
+
+TMP_ROOT_ABS=$(resolve_path "$TMP_ROOT")
+ENGINE_DOCS_DIR=$(resolve_path "$ENGINE_DOCS_DIR")
 APP_PID_FILE="$ROOT_DIR/runtime/pids/web.pid"
 APP_LOG_FILE="$ROOT_DIR/runtime/logs/web.log"
-INCOMING_DIR="$ROOT_DIR/runtime/tmp/incoming"
+INCOMING_DIR="$TMP_ROOT_ABS/incoming"
 
 log() {
   printf '[qvf-extractor] %s\n' "$*"
@@ -123,7 +134,7 @@ install_qlik_cli() {
 }
 
 prepare_runtime() {
-  mkdir -p "$ROOT_DIR/runtime/logs" "$ROOT_DIR/runtime/pids" "$TMP_ROOT" "$INCOMING_DIR" "$ENGINE_DOCS_DIR"
+  mkdir -p "$ROOT_DIR/runtime/logs" "$ROOT_DIR/runtime/pids" "$TMP_ROOT_ABS" "$INCOMING_DIR" "$ENGINE_DOCS_DIR"
 }
 
 engine_running() {
@@ -152,6 +163,7 @@ start_engine() {
     --name "$ENGINE_CONTAINER_NAME" \
     -p 127.0.0.1:9076:9076 \
     -v "$ENGINE_DOCS_DIR:/engine-data" \
+    -v "$TMP_ROOT_ABS:$TMP_ROOT_ABS" \
     "$ENGINE_IMAGE_REF" \
     -S AcceptEULA=yes -S DocumentDirectory=/engine-data >/dev/null
 }
