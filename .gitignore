@@ -2,5 +2,9 @@ node_modules/
 runtime/
 artifacts/*.tar
 artifacts/*.txt
+artifacts/output/
 .env
 .DS_Store
+.venv/
+__pycache__/
+scripts/__pycache__/

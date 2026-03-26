@@ -62,7 +62,8 @@ form.addEventListener('submit', async (event) => {
 
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
-      throw new Error(payload.error || 'The file could not be processed.');
+      const detail = payload.jobId ? ` Job ID: ${payload.jobId}` : '';
+      throw new Error((payload.error || 'The file could not be processed.') + detail);
     }
 
     setStatus('Preparing download', 'busy');

@@ -1,8 +1,8 @@
 {
   "name": "qvf-metadata-extractor",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Upload a QVF file, extract app metadata through Qlik Core, and download the result as a ZIP.",
+  "description": "Upload a QVF file, analyze it with a Python extractor, and download the extracted metadata as a ZIP.",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
@@ -12,7 +12,6 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "archiver": "^7.0.1",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
     "multer": "^2.0.2"

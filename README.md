@@ -1,119 +1,119 @@
 # QVF Metadata Extractor
 
-📦 A focused web utility for extracting metadata from Qlik `.qvf` files through a local Qlik Core engine.
+🧩 A focused utility for reading Qlik `.qvf` files directly and packaging the discovered metadata into a downloadable ZIP archive.
 
-The application provides a simple browser-based workflow:
+The project now follows a host-native approach:
 
-- upload a `.qvf` file
-- process it through Qlik Core and `qlik-cli`
-- download the extracted metadata as a ZIP archive
+- upload a `.qvf` file through the web UI
+- analyze the file with a Python extractor
+- download the extracted metadata package
+- remove the temporary upload and job folder afterward
 
-The service is designed for self-hosting on Ubuntu `24.04.x` and exposes the web interface on:
+No Qlik runtime, Docker container, or external engine is required for the extraction path.
 
-- `http://<server-ip>:5165`
+## ✨ What This Tool Does
 
-## ✨ Overview
+The extractor reads the `.qvf` file format directly and pulls out the structured information that can be decoded without opening the app in Qlik Sense.
 
-QVF Metadata Extractor is intended for cases where a Qlik application needs to be inspected outside a broader Qlik environment. Instead of opening the app manually in a desktop workflow, the uploaded file is processed on the server and transformed into a structured metadata export.
+The ZIP result is designed to be useful for both human inspection and follow-up parser work. It typically includes:
 
-The project focuses on:
-
-- a minimal and clear user flow
-- temporary handling of uploaded files
-- automatic cleanup after processing
-- deployment through `git clone` and `./start.sh`
-
-## 🧭 What The Tool Does
-
-When a `.qvf` file is uploaded through the web interface, the application performs the following workflow:
-
-1. The uploaded file is stored in a temporary folder on the server.
-2. The file is imported into a local Qlik Core engine instance.
-3. `qlik-cli` runs the `app unbuild` command against the imported app.
-4. The extracted metadata files are packaged into a ZIP archive.
-5. The ZIP archive is returned to the browser as a download.
-6. The uploaded file, extracted temporary files, and temporary engine app are removed.
-
-This keeps the server focused on short-lived processing rather than long-term storage.
-
-## ⚙️ Runtime Architecture
-
-The solution uses two runtime components:
-
-- **Node.js web application**
-- **Qlik Core engine running locally in Docker**
-
-This runtime split is intentional:
-
-- the web application is the only public entrypoint
-- the Qlik Core engine is bound to `127.0.0.1:9076`
-- the browser never connects directly to the engine
-
-## 🖥️ Web Interface
-
-The web interface is intentionally compact and task-oriented. It includes:
-
-- a file input for `.qvf` uploads
-- a primary action to start extraction
-- visible status messages during processing
-- an English explanation of what happens to the uploaded app
-- an English overview of the technology used
-
-The UI is styled to remain clean, business-like, and easy to understand on both desktop and mobile screens.
+- `manifest.json`
+- `app.json`
+- `sheets.json`
+- `masterobjects.json`
+- `measures.json`
+- `dimensions.json`
+- `variables.json`
+- `script.qvs`
+- `data-sources.json`
+- `assets.json`
+- `data-model.json`
+- `load-model.json`
+- `color-maps.json`
+- `summary.txt`
+- `raw/blocks.jsonl`
+- `raw/decoded-objects.jsonl`
+- `raw/string-findings.txt`
+- `raw/unknown-blocks.json`
 
 ## 🔄 Processing Flow
 
-The backend exposes a small HTTP surface:
+When a `.qvf` file is uploaded, the application performs the following workflow:
 
-- `GET /`
-- `POST /api/extract`
-- `GET /healthz`
+1. The file is stored in a temporary job folder under `runtime/tmp/`.
+2. The Node.js web service invokes the Python extractor.
+3. The extractor scans the QVF structure for `gzjson` and binary records.
+4. Structured payloads are decoded into JSON output files.
+5. The load script is extracted and saved as `script.qvs`.
+6. Embedded media items are exported when they can be cleanly bounded.
+7. A ZIP archive is created and returned to the browser.
+8. After processing, the uploaded file and temporary extraction folder are removed.
 
-The extraction endpoint performs these tasks:
+Version 1 processes one upload at a time. If another extraction is already running, the service returns a busy response instead of running jobs in parallel.
 
-- validates the uploaded file
-- writes it to a temporary job folder
-- imports the app via `qlik app import`
-- runs `qlik app unbuild`
-- creates a ZIP archive from the extracted output
-- streams the ZIP file back to the browser
-- removes temporary files and the temporary imported app
+## 🧠 Runtime Design
 
-Version 1 processes one upload at a time. If another extraction is already running, the service returns a busy response instead of running parallel jobs.
+The repository contains two cooperating parts:
 
-## 🧰 Technology Used
+- **Node.js web layer**
+  - serves the UI
+  - accepts uploads
+  - manages temporary job folders
+  - streams the ZIP result back to the browser
+- **Python extractor**
+  - parses the QVF file directly
+  - decodes structured payload blocks
+  - writes normalized metadata files
+  - creates the downloadable ZIP archive
 
-The repository uses the following components:
+This keeps the web layer small and makes the extractor reusable as a standalone CLI tool.
 
-- **Node.js**
-- **Express**
-- **Multer**
-- **Archiver**
-- **Qlik CLI**
-- **Qlik Core Engine**
-- **Docker** on the server for the engine runtime only
+## 🖥️ Web Interface
+
+The web interface is available on:
+
+- `http://<server-ip>:5165`
+
+The page is intentionally compact and task-oriented. It includes:
+
+- a `.qvf` file input
+- a primary action to start extraction
+- live upload and processing status
+- an English explanation of the file lifecycle
+- an English summary of the runtime components
+
+## 🐍 Running The Extractor Directly
+
+The Python extractor can also be run without the web UI, which makes local analysis on macOS or Linux straightforward as long as Python 3 is available.
+
+Example:
+
+```bash
+python3 scripts/extract_qvf.py "Asset Management.qvf" \
+  --output-dir artifacts/output/asset-management \
+  --zip artifacts/output/asset-management.zip
+```
+
+This creates the extracted metadata folder and a matching ZIP archive.
 
 ## 🚀 Installation And Startup
 
-This repository is intended for Ubuntu `24.04.x` LTS.
+### Ubuntu 24.04 server
 
-After cloning the repository on the target server, the full installation and startup process is handled by:
+After cloning the repository on the target server:
 
 ```bash
 ./start.sh
 ```
 
-The script is responsible for:
+The script:
 
-- validating the operating system
-- installing required system packages
-- installing Docker Engine
-- installing Node.js
-- installing npm dependencies
-- downloading and installing `qlik-cli`
-- pulling the pinned Qlik Core engine image
-- starting the engine locally
-- starting the web application on port `5165`
+- installs base packages on Ubuntu if needed
+- installs Node.js if it is missing or too old
+- verifies Python availability
+- installs npm dependencies
+- creates runtime folders
+- starts the web application on port `5165`
 
 To stop the service:
 
@@ -121,7 +121,17 @@ To stop the service:
 ./stop.sh
 ```
 
-## 🧱 Configuration
+### macOS or other local environments
+
+The Python extractor itself can run without Docker as long as Python 3 is available.
+
+If you also want the web UI locally, ensure `node`, `npm`, and `python3` are installed and then run:
+
+```bash
+./start.sh
+```
+
+## ⚙️ Configuration
 
 Default runtime values are listed in [.env.example](./.env.example).
 
@@ -130,74 +140,61 @@ Key defaults:
 ```env
 PORT=5165
 HOST=0.0.0.0
-ENGINE_URL=127.0.0.1:9076
 MAX_UPLOAD_MB=512
 TMP_ROOT=./runtime/tmp
 JOB_TTL_MINUTES=30
-QLIK_BIN=./bin/qlik
-ENGINE_CONTAINER_NAME=qlik-engine
+PYTHON_BIN=python3
+EXTRACTOR_SCRIPT=./scripts/extract_qvf.py
 KEEP_FAILED_JOBS=false
 ```
 
 ## 🗂️ Temporary Data And Cleanup
 
-Runtime data is created under the local `runtime/` folder structure and is not meant for source control.
+Runtime data is stored under `runtime/` and is not meant for source control.
 
 Cleanup happens in two ways:
 
-- immediately after a successful or failed extraction
-- periodically for stale job folders older than the configured TTL
+- immediately after a successful extraction
+- automatically for stale job folders older than the configured TTL
 
-This keeps the service aligned with temporary processing rather than file retention.
-
-If you need to inspect failed imports, set:
+If you need to inspect a failed run, set:
 
 ```env
 KEEP_FAILED_JOBS=true
 ```
 
-When enabled, failed job folders are preserved under `runtime/tmp/jobs/<job-id>/` together with a `failure-report.txt` file for debugging.
+Failed jobs are then preserved under `runtime/tmp/jobs/<job-id>/` together with a `failure-report.txt`.
 
-## 🧷 Engine Image Retention
+## 📦 Output Notes
 
-The Qlik Core engine image is pinned in [config/engine-image.env](./config/engine-image.env) by tag and digest.
+The extractor is designed to be transparent about what it can and cannot decode.
 
-To create an offline archive of the engine image:
+That means the output intentionally contains both:
 
-```bash
-./scripts/backup-engine-image.sh
-```
+- normalized metadata files such as `sheets.json`, `measures.json`, and `script.qvs`
+- raw evidence files such as `raw/decoded-objects.jsonl` and `raw/unknown-blocks.json`
 
-To restore it later:
+This makes it easier to extend the parser over time without losing traceability back to the original file structure.
 
-```bash
-./scripts/restore-engine-image.sh
-```
+## ⚠️ Scope And Limits
 
-This is useful when the engine image must remain available independently of the upstream registry.
+This project does **not** claim to be a drop-in replacement for `qlik app unbuild`.
+
+Instead, it provides a Linux- and macOS-friendly extraction path that works by analyzing the QVF file structure directly. Many modern QVF files expose rich structured metadata this way, but some binary blocks remain opaque and are explicitly listed as such in the output.
 
 ## 📌 Operational Notes
 
 - Open TCP port `5165` in the Hetzner firewall if the interface must be reachable externally.
-- The Qlik Core engine itself is intentionally not exposed publicly.
-- The service is currently HTTP-only.
-- The repository is designed for direct server deployment rather than local container-based development.
+- The service currently runs over HTTP only.
+- The extraction path is host-native and does not depend on Docker.
+- The Python CLI is suitable for local offline analysis when no web service is needed.
 
 ## ❤️ Practical Summary
 
-This project provides a controlled way to:
+This repository provides a controlled way to:
 
 - upload a Qlik app
-- extract its metadata
-- download the result
-- remove temporary processing data automatically
-
-The implementation stays deliberately small, operationally clear, and easy to run on a single Ubuntu server.
-
-## 🔗 References
-
-- [Qlik CLI install](https://qlik.dev/toolkits/qlik-cli/install-qlik-cli/)
-- [Qlik CLI app import](https://qlik.dev/toolkits/qlik-cli/app/app-import/)
-- [Qlik CLI app unbuild](https://qlik.dev/toolkits/qlik-cli/app/app-unbuild/)
-- [Qlik CLI app rm](https://qlik.dev/toolkits/qlik-cli/app/app-rm/)
-- [Qlik Core engine image](https://hub.docker.com/r/qlikcore/engine)
+- decode as much metadata as possible directly from the `.qvf`
+- keep the load script as a real `.qvs` file
+- download the result as a ZIP package
+- clean up temporary server-side files automatically

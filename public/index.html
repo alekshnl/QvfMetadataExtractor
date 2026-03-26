@@ -10,11 +10,11 @@
     <main class="shell">
       <section class="hero panel">
         <div class="hero-copy">
-          <p class="eyebrow">Qlik Metadata Extraction</p>
-          <h1>Upload a QVF file and download its extracted metadata.</h1>
+          <p class="eyebrow">QVF Structure Analysis</p>
+          <h1>Upload a QVF file and download its extracted metadata package.</h1>
           <p class="lede">
-            This service imports a Qlik app into a local Qlik Core engine, runs the Qlik CLI unbuild process,
-            and returns the extracted metadata as a ZIP file.
+            This service reads the QVF file directly, decodes structured metadata blocks where possible, extracts the
+            load script as a <code>.qvs</code> file, and returns the result as a ZIP archive.
           </p>
         </div>
         <form id="upload-form" class="upload-card" novalidate>
@@ -32,10 +32,10 @@
           <h2>What happens to your app?</h2>
           <ol class="steps">
             <li>The uploaded <code>.qvf</code> file is written to a temporary folder on the server.</li>
-            <li>The file is imported into a local Qlik Core engine that is only reachable from this server.</li>
-            <li>The Qlik CLI runs the <code>app unbuild</code> process to extract the app metadata into files.</li>
+            <li>A Python extractor scans the QVF structure for metadata records, scripts, variables, data sources, and embedded assets.</li>
+            <li>Structured findings are written into JSON files, the load script is saved as <code>script.qvs</code>, and raw evidence files are added for traceability.</li>
             <li>The extracted output is packaged into a ZIP file and sent back to your browser as a download.</li>
-            <li>After processing, the uploaded app file, temporary metadata files, and temporary engine app are deleted.</li>
+            <li>After processing, the uploaded file and temporary extraction folder are deleted from the server.</li>
           </ol>
         </div>
         <div>
@@ -44,10 +44,10 @@
             <li><span>Node.js</span><small>Application runtime for the web service</small></li>
             <li><span>Express</span><small>HTTP server and static file delivery</small></li>
             <li><span>Multer</span><small>Temporary file upload handling</small></li>
-            <li><span>Archiver</span><small>ZIP creation for the metadata download</small></li>
-            <li><span>Qlik CLI</span><small>Import, unbuild, and cleanup commands</small></li>
-            <li><span>Qlik Core Engine</span><small>Local engine runtime used for processing the uploaded app</small></li>
-            <li><span>Docker</span><small>Server-side runtime for the Qlik Core engine only</small></li>
+            <li><span>Python 3</span><small>Extractor runtime for QVF analysis and ZIP generation</small></li>
+            <li><span>zlib + JSON</span><small>Decoding of structured payload blocks found inside the QVF</small></li>
+            <li><span>zipfile</span><small>Packaging of the metadata result for download</small></li>
+            <li><span>No Docker runtime</span><small>The extraction path runs directly on the host without Qlik Core</small></li>
           </ul>
         </div>
       </section>

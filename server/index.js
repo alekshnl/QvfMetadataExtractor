@@ -7,7 +7,6 @@ const { promisify } = require('node:util');
 
 const express = require('express');
 const multer = require('multer');
-const archiver = require('archiver');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -22,8 +21,8 @@ const incomingDir = path.join(tmpRoot, 'incoming');
 const jobsRoot = path.join(tmpRoot, 'jobs');
 const host = process.env.HOST || '0.0.0.0';
 const port = Number(process.env.PORT || 5165);
-const engineUrl = process.env.ENGINE_URL || '127.0.0.1:9076';
-const qlikBin = path.resolve(rootDir, process.env.QLIK_BIN || './bin/qlik');
+const pythonBin = process.env.PYTHON_BIN || 'python3';
+const extractorScript = path.resolve(rootDir, process.env.EXTRACTOR_SCRIPT || './scripts/extract_qvf.py');
 const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 512);
 const jobTtlMinutes = Number(process.env.JOB_TTL_MINUTES || 30);
 const keepFailedJobs = String(process.env.KEEP_FAILED_JOBS || 'false').toLowerCase() === 'true';
@@ -47,12 +46,14 @@ async function ensureRuntimeDirectories() {
 }
 
 function sanitizeBaseName(filename) {
-  return path
-    .basename(filename, path.extname(filename))
-    .replace(/[^a-zA-Z0-9-_]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 80) || 'app';
+  return (
+    path
+      .basename(filename, path.extname(filename))
+      .replace(/[^a-zA-Z0-9-_]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 80) || 'app'
+  );
 }
 
 async function safeUnlink(filePath) {
@@ -104,65 +105,19 @@ async function writeFailureReport(jobDir, details) {
   await fsp.writeFile(reportPath, `${lines.join('\n')}\n`, 'utf8');
 }
 
-async function runQlik(args) {
-  const { stdout, stderr } = await execFileAsync(qlikBin, args, {
-    cwd: rootDir,
-    maxBuffer: 20 * 1024 * 1024,
-    env: {
-      ...process.env,
-      HOME: process.env.HOME,
-    },
-  });
-
-  return {
-    stdout: stdout.trim(),
-    stderr: stderr.trim(),
-  };
-}
-
-function explainQlikError(error, args) {
-  const stderr = (error.stderr || '').trim();
-  const command = args.join(' ');
-
-  if (command.includes('app import') && stderr.includes('500 Internal Error')) {
-    return 'The Qlik engine returned a generic import error. This usually means the engine container cannot read the uploaded QVF path from the host runtime folder.';
-  }
-
-  return stderr || error.message;
-}
-
-function buildEngineArgs(commandArgs) {
-  return [...commandArgs, '--server', engineUrl, '--server-type', 'engine'];
-}
-
-function parseImportedAppId(output) {
-  if (!output) {
-    throw new Error('Qlik CLI did not return an app identifier.');
-  }
-
-  const lastToken = output.split(/\s+/).pop();
-  if (!lastToken) {
-    throw new Error('Unable to parse the imported app identifier.');
-  }
-
-  return lastToken.trim();
-}
-
-async function zipDirectory(sourceDir, targetZipPath) {
-  await fsp.mkdir(path.dirname(targetZipPath), { recursive: true });
-
-  return new Promise((resolve, reject) => {
-    const output = fs.createWriteStream(targetZipPath);
-    const archive = archiver('zip', { zlib: { level: 9 } });
-
-    output.on('close', resolve);
-    output.on('error', reject);
-    archive.on('error', reject);
-
-    archive.pipe(output);
-    archive.directory(sourceDir, false);
-    archive.finalize();
-  });
+async function runExtractor(inputFile, extractDir, zipPath) {
+  return execFileAsync(
+    pythonBin,
+    [extractorScript, inputFile, '--output-dir', extractDir, '--zip', zipPath],
+    {
+      cwd: rootDir,
+      maxBuffer: 20 * 1024 * 1024,
+      env: {
+        ...process.env,
+        HOME: process.env.HOME,
+      },
+    }
+  );
 }
 
 async function sendDownload(res, absolutePath, downloadName) {
@@ -205,19 +160,6 @@ async function prepareJobDirectories(paths) {
   ]);
 }
 
-async function assertReadableFile(filePath) {
-  await fsp.access(filePath, fs.constants.R_OK);
-}
-
-async function removeImportedApp(appId) {
-  if (!appId) return;
-  try {
-    await runQlik(buildEngineArgs(['app', 'rm', appId]));
-  } catch (error) {
-    console.error(`Failed to remove imported app ${appId}:`, error.stderr || error.message);
-  }
-}
-
 function uploadMiddleware(req, res, next) {
   upload.single('qvf')(req, res, (error) => {
     if (!error) {
@@ -241,7 +183,8 @@ app.get('/healthz', async (_req, res) => {
     ok: true,
     busy: Boolean(activeJobId),
     port,
-    engineUrl,
+    pythonBin,
+    extractorScript,
   });
 });
 
@@ -259,7 +202,7 @@ app.post('/api/extract', uploadMiddleware, async (req, res) => {
     return;
   }
 
-  if (path.extname(req.file.originalname).toLowerCase() !== '.qvf') {
+  if (!req.file.originalname.toLowerCase().endsWith('.qvf')) {
     await safeUnlink(req.file.path);
     res.status(400).json({ error: 'Only .qvf files are supported.' });
     return;
@@ -267,80 +210,59 @@ app.post('/api/extract', uploadMiddleware, async (req, res) => {
 
   const jobId = crypto.randomUUID();
   const paths = createJobPaths(jobId, req.file.originalname);
-  const appName = `${paths.baseName}-${jobId.slice(0, 8)}`;
-  let appId = null;
-  let lastQlikArgs = null;
-  let failed = false;
+  let extractorStdout = '';
+  let extractorStderr = '';
+  let statusCode = 500;
+  let errorMessage = 'The file could not be processed.';
+  let completed = false;
 
   activeJobId = jobId;
 
   try {
     await prepareJobDirectories(paths);
     await fsp.rename(req.file.path, paths.uploadedFile);
-    await assertReadableFile(paths.uploadedFile);
 
-    lastQlikArgs = buildEngineArgs(['app', 'import', '--quiet', '--name', appName, '--file', paths.uploadedFile]);
-    const importResult = await runQlik(lastQlikArgs);
-    appId = parseImportedAppId(importResult.stdout);
+    const result = await runExtractor(paths.uploadedFile, paths.extractDir, paths.zipPath);
+    extractorStdout = (result.stdout || '').trim();
+    extractorStderr = (result.stderr || '').trim();
 
-    await safeUnlink(paths.uploadedFile);
-
-    lastQlikArgs = buildEngineArgs(['app', 'unbuild', '-a', appId, '--dir', paths.extractDir]);
-    await runQlik(lastQlikArgs);
-
-    await zipDirectory(paths.extractDir, paths.zipPath);
+    await fsp.access(paths.zipPath, fs.constants.R_OK);
     await sendDownload(res, paths.zipPath, path.basename(paths.zipPath));
+    completed = true;
   } catch (error) {
-    failed = true;
-    const details = explainQlikError(error, lastQlikArgs || []);
+    extractorStdout = (error.stdout || extractorStdout || '').trim();
+    extractorStderr = (error.stderr || extractorStderr || '').trim();
+    errorMessage = extractorStderr || error.message || errorMessage;
 
-    if (keepFailedJobs) {
-      await writeFailureReport(paths.jobDir, {
-        jobId,
-        uploadedFile: paths.uploadedFile,
-        extractDir: paths.extractDir,
-        zipPath: paths.zipPath,
-        appId,
-        qlikCommand: (lastQlikArgs || []).join(' '),
-        details,
-      }).catch((reportError) => {
-        console.error('Failed to write failure report:', reportError);
-      });
-    }
+    await writeFailureReport(paths.jobDir, {
+      jobId,
+      uploadedFile: paths.uploadedFile,
+      extractDir: paths.extractDir,
+      zipPath: paths.zipPath,
+      pythonBin,
+      extractorScript,
+      stdout: extractorStdout,
+      stderr: extractorStderr,
+      error: error.message,
+    }).catch(() => {});
 
-    console.error(error);
     if (!res.headersSent) {
-      res.status(500).json({
-        error: 'The QVF file could not be processed.',
-        details,
-        jobId: keepFailedJobs ? jobId : undefined,
-      });
+      res.status(statusCode).json({ error: errorMessage, jobId });
     }
   } finally {
-    await removeImportedApp(appId);
-    await safeUnlink(req.file?.path);
-    if (!(failed && keepFailedJobs)) {
+    activeJobId = null;
+    if (!completed && !keepFailedJobs) {
       await safeRm(paths.jobDir);
     }
-    activeJobId = null;
+    if (completed) {
+      await safeRm(paths.jobDir);
+    }
   }
-});
-
-app.get('*', (_req, res) => {
-  res.sendFile(path.join(publicDir, 'index.html'));
 });
 
 async function start() {
   await ensureRuntimeDirectories();
   await cleanupExpiredJobs();
-
-  const cleanupTimer = setInterval(() => {
-    cleanupExpiredJobs().catch((error) => {
-      console.error('Failed to clean up expired jobs:', error);
-    });
-  }, 10 * 60 * 1000);
-
-  cleanupTimer.unref?.();
 
   app.listen(port, host, () => {
     console.log(`Server listening on http://${host}:${port}`);
@@ -348,6 +270,6 @@ async function start() {
 }
 
 start().catch((error) => {
-  console.error('Failed to prepare runtime directories:', error);
+  console.error(error);
   process.exit(1);
 });
