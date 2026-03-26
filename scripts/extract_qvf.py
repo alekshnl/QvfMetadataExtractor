@@ -12,6 +12,7 @@ import sys
 import uuid
 import zlib
 from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -31,6 +32,13 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp")
 INTEGER_TAG = 5
 STRING_TAG = 4
 DOUBLE_TAG = 2
+QLIK_EPOCH = datetime(1899, 12, 30)
+STANDARD_CURRENCY_SYMBOLS = {
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -569,7 +577,12 @@ def parse_scalar_stream(output: bytes) -> dict[str, Any] | None:
         return None
     position = 8
     values: list[Any] = []
-    tags: list[str] = []
+    tags: list[int] = []
+
+    def decode_int_token(raw: bytes) -> str:
+        if raw and all(32 <= byte < 127 for byte in raw):
+            return raw.decode("ascii", errors="ignore")
+        return str(int.from_bytes(raw, "little"))
 
     while position < len(output):
         tag = output[position]
@@ -583,13 +596,13 @@ def parse_scalar_stream(output: bytes) -> dict[str, Any] | None:
                 return None
             values.append(output[position : position + length].decode("utf-8", errors="ignore"))
             position += length
-            tags.append("str")
+            tags.append(tag)
         elif tag == DOUBLE_TAG:
             if position + 8 > len(output):
                 return None
             values.append(struct.unpack("<d", output[position : position + 8])[0])
             position += 8
-            tags.append("double")
+            tags.append(tag)
         elif tag == INTEGER_TAG:
             if position >= len(output):
                 return None
@@ -597,24 +610,91 @@ def parse_scalar_stream(output: bytes) -> dict[str, Any] | None:
             position += 1
             if position + length > len(output):
                 return None
-            values.append(int.from_bytes(output[position : position + length], "little"))
+            raw = output[position : position + length]
             position += length
-            tags.append("int")
+            if position + 4 <= len(output) and (position + 4 == len(output) or output[position + 4] in {STRING_TAG, DOUBLE_TAG, INTEGER_TAG, 6}):
+                numeric = int.from_bytes(output[position : position + 4], "little")
+                position += 4
+                values.append((tag, raw, numeric))
+            else:
+                values.append((tag, raw))
+            tags.append(tag)
+        elif tag == 1:
+            if position + 4 > len(output):
+                return None
+            numeric = int.from_bytes(output[position : position + 4], "little")
+            position += 4
+            values.append((tag, numeric))
+            tags.append(tag)
+        elif tag == 6:
+            if position >= len(output):
+                return None
+            length = output[position]
+            position += 1
+            if position + length + 8 > len(output):
+                return None
+            text = output[position : position + length].decode("utf-8", errors="ignore")
+            position += length
+            numeric = struct.unpack("<d", output[position : position + 8])[0]
+            position += 8
+            values.append((tag, text, numeric))
+            tags.append(tag)
         else:
             return None
 
     if position != len(output) or len(values) != value_count:
         return None
 
-    unique_types = set(tags)
-    if len(unique_types) != 1:
-        return None
+    tag_set = set(tags)
+    if tag_set.issubset({STRING_TAG, INTEGER_TAG, 1}) and STRING_TAG in tag_set:
+        normalized: list[str] = []
+        for value in values:
+            if isinstance(value, tuple) and len(value) == 3:
+                _tag, raw, numeric = value
+                token = raw.decode("ascii", errors="ignore") if raw and all(32 <= byte < 127 for byte in raw) else str(numeric)
+                normalized.append(token)
+            elif isinstance(value, tuple) and len(value) == 2 and value[0] == 1:
+                _tag, numeric = value
+                normalized.append(str(numeric))
+            elif isinstance(value, tuple):
+                _tag, raw = value
+                normalized.append(decode_int_token(raw))
+            else:
+                normalized.append(str(value))
+        return {
+            "count": value_count,
+            "value_type": "str",
+            "values": normalized,
+        }
 
-    return {
-        "count": value_count,
-        "value_type": next(iter(unique_types)),
-        "values": values,
-    }
+    if tag_set.issubset({DOUBLE_TAG, INTEGER_TAG, 6, 1}):
+        normalized_numeric: list[float | int] = []
+        for value in values:
+            if isinstance(value, tuple) and len(value) == 3:
+                _tag, _raw, numeric = value
+                normalized_numeric.append(numeric)
+            elif isinstance(value, tuple) and len(value) == 2 and value[0] == 1:
+                _tag, numeric = value
+                normalized_numeric.append(numeric)
+            elif isinstance(value, tuple) and len(value) == 2:
+                _tag, raw = value
+                normalized_numeric.append(int.from_bytes(raw, "little"))
+            else:
+                normalized_numeric.append(value)
+
+        if all(abs(float(item) - round(float(item))) < 1e-9 for item in normalized_numeric):
+            return {
+                "count": value_count,
+                "value_type": "int",
+                "values": [int(round(float(item))) for item in normalized_numeric],
+            }
+        return {
+            "count": value_count,
+            "value_type": "double",
+            "values": [float(item) for item in normalized_numeric],
+        }
+
+    return None
 
 
 def infer_scalar_traits(values: list[Any], value_type: str) -> dict[str, Any]:
@@ -725,6 +805,93 @@ def classify_non_scalar_streams(
     return rows
 
 
+def discover_index_vectors(
+    blob: bytes,
+    format_blocks: list[dict[str, Any]],
+    table_specs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    known_ranges = [(block["payload_offset"], block["payload_end"]) for block in format_blocks]
+    large_specs = [spec for spec in table_specs if spec["row_count"] >= 100]
+    vectors: list[dict[str, Any]] = []
+    seen_signatures: set[tuple[int, str, int, int]] = set()
+
+    def unpack_lsb_values(payload: bytes, header_bytes: int, bits_per_value: int, count: int) -> list[int]:
+        data = payload[header_bytes:]
+        mask = (1 << bits_per_value) - 1
+        values: list[int] = []
+        bit_offset = 0
+        for _ in range(count):
+            byte_index = bit_offset // 8
+            shift = bit_offset % 8
+            chunk = int.from_bytes(data[byte_index : byte_index + 4], "little")
+            values.append((chunk >> shift) & mask)
+            bit_offset += bits_per_value
+        return values
+
+    def vector_cardinality_distance(unique_count: int, max_value: int, cardinality: int) -> int:
+        candidates = [
+            abs(unique_count - cardinality),
+            abs((unique_count - 1) - cardinality),
+            abs(max_value - cardinality),
+            abs((max_value - 1) - cardinality),
+            abs((max_value + 1) - cardinality),
+        ]
+        return min(candidates)
+
+    for stream in iter_unique_zlib_streams(blob, known_ranges):
+        if stream["within_known_payload"] or parse_scalar_stream(stream["output"]):
+            continue
+
+        output = stream["output"]
+        for spec in large_specs:
+            row_count = spec["row_count"]
+            field_cardinalities = [int(field.get("qcardinal") or 0) for field in spec["fields"] if int(field.get("qcardinal") or 0) > 0]
+            if not field_cardinalities:
+                continue
+            discovery_ratio = 0.25 if any(is_key_field(field) for field in spec["fields"]) else 0.15
+
+            for bits_per_value in range(1, 17):
+                data_bytes = (row_count * bits_per_value + 7) // 8
+                header_bytes = len(output) - data_bytes
+                if header_bytes < 0 or header_bytes > 16:
+                    continue
+
+                signature = (stream["offset"], spec["name"], bits_per_value, header_bytes)
+                if signature in seen_signatures:
+                    continue
+
+                values = unpack_lsb_values(output, header_bytes, bits_per_value, row_count)
+                unique_values = sorted(set(values))
+                max_value = max(unique_values)
+                unique_count = len(unique_values)
+                best_cardinality = min(field_cardinalities, key=lambda item: vector_cardinality_distance(unique_count, max_value, item))
+                best_distance = vector_cardinality_distance(unique_count, max_value, best_cardinality)
+                discovery_threshold = max(1, int(best_cardinality * discovery_ratio))
+
+                if best_distance > discovery_threshold:
+                    continue
+
+                seen_signatures.add(signature)
+                vectors.append(
+                    {
+                        "offset": stream["offset"],
+                        "table": spec["name"],
+                        "row_count": row_count,
+                        "bits_per_value": bits_per_value,
+                        "header_bytes": header_bytes,
+                        "values": values,
+                        "min": min(unique_values),
+                        "max": max_value,
+                        "unique_count": unique_count,
+                        "unique_values": unique_values,
+                        "best_cardinality": best_cardinality,
+                        "best_distance": best_distance,
+                    }
+                )
+
+    return vectors
+
+
 def build_block_index(
     format_blocks: list[dict[str, Any]], blob: bytes
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -811,8 +978,34 @@ def is_integer_field(field: dict[str, Any]) -> bool:
     return "$integer" in (field.get("qtags") or [])
 
 
+def is_key_field(field: dict[str, Any]) -> bool:
+    return "$key" in (field.get("qtags") or []) or bool(field.get("qdistinct_only"))
+
+
+def is_numeric_identifier_key_field(field: dict[str, Any]) -> bool:
+    field_name = (field.get("qname") or "").lower()
+    if "cusip" in field_name or "code" in field_name or field_name == "%key":
+        return False
+    return is_key_field(field) and is_numeric_field(field) and ("id" in field_name or "$integer" in (field.get("qtags") or []))
+
+
+def field_value_kind(field: dict[str, Any]) -> str:
+    if is_numeric_identifier_key_field(field):
+        return "numeric"
+    if is_key_field(field):
+        return "text"
+    return "numeric" if is_numeric_field(field) else "text"
+
+
+def scalar_stream_matches_field(field: dict[str, Any], stream: dict[str, Any]) -> bool:
+    kind = field_value_kind(field)
+    if kind == "numeric":
+        return stream["value_type"] in {"double", "int"}
+    return stream["value_type"] == "str"
+
+
 def normalize_stream_values(field: dict[str, Any], values: list[Any]) -> list[Any]:
-    if not is_numeric_field(field):
+    if field_value_kind(field) != "numeric":
         return [str(value) if value is not None else None for value in values]
 
     normalized: list[Any] = []
@@ -848,7 +1041,7 @@ def default_column_confidence(field: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": "missing",
         "coverage_ratio": 0.0,
-        "inferred_type": "numeric" if is_numeric_field(field) else "string",
+        "inferred_type": field_value_kind(field),
         "notes": "No row-aligned reconstruction found yet.",
         "source_block_offsets": [],
         "candidate_dictionary_offsets": [],
@@ -882,7 +1075,7 @@ def set_column(
     table_state["confidence"][field_name] = {
         "status": status,
         "coverage_ratio": round(coverage, 6),
-        "inferred_type": "numeric" if is_numeric_field(field) else "string",
+        "inferred_type": field_value_kind(field),
         "notes": notes,
         "source_block_offsets": source_offsets,
         "candidate_dictionary_offsets": table_state["confidence"][field_name].get("candidate_dictionary_offsets", []),
@@ -946,10 +1139,253 @@ def looks_like_sector_names(stream: dict[str, Any]) -> bool:
     return stream["value_type"] == "str" and stream["count"] == 10 and stream["traits"].get("contains_sector_words") and not stream["traits"].get("contains_company_words")
 
 
+def looks_like_code_dictionary(stream: dict[str, Any]) -> bool:
+    if stream["value_type"] != "str":
+        return False
+    values = [str(value) for value in stream["values"] if value is not None]
+    if not values:
+        return False
+    pattern = re.compile(r"[A-Z0-9][A-Z0-9_./-]{1,15}$")
+    match_ratio = sum(bool(pattern.fullmatch(value)) for value in values) / len(values)
+    return match_ratio >= 0.8 and stream["traits"].get("space_ratio", 1.0) <= 0.15
+
+
+def looks_like_org_code_dictionary(stream: dict[str, Any]) -> bool:
+    return looks_like_code_dictionary(stream) and any("_" in str(value) or len(str(value)) > 6 for value in stream["values"])
+
+
+def looks_like_people_names(stream: dict[str, Any]) -> bool:
+    if stream["value_type"] != "str":
+        return False
+    values = [str(value) for value in stream["values"] if value]
+    if not values:
+        return False
+    spaced_ratio = sum(" " in value or "," in value for value in values) / len(values)
+    return spaced_ratio >= 0.6 and stream["traits"].get("average_length", 0) >= 8
+
+
+def looks_like_metric_labels(stream: dict[str, Any]) -> bool:
+    if stream["value_type"] != "str":
+        return False
+    metric_terms = {"Alpha", "Beta", "R-squared", "Sharpe ratio", "Mean annual return", "Standard deviation"}
+    values = {str(value) for value in stream["values"] if value}
+    return bool(values) and values.issubset(metric_terms)
+
+
+def looks_like_trade_source_codes(stream: dict[str, Any]) -> bool:
+    if stream["value_type"] != "str":
+        return False
+    values = {str(value) for value in stream["values"] if value}
+    return bool(values) and values.issubset({"CRD", "TB", "INTERNAL_TB"})
+
+
+def looks_like_trade_status_values(stream: dict[str, Any]) -> bool:
+    if stream["value_type"] != "str":
+        return False
+    values = {str(value).upper() for value in stream["values"] if value}
+    allowed = {"CREATE", "CANCEL", "AMEND", "ALLOCATED", "MATCHED", "SETTLED", "PENDING", "BOOKED", "CONFIRMED", "FAILED"}
+    return bool(values) and values.issubset(allowed)
+
+
+def looks_like_buy_sell_values(stream: dict[str, Any]) -> bool:
+    if stream["value_type"] != "str":
+        return False
+    values = {str(value) for value in stream["values"] if value}
+    return bool(values) and values.issubset({"Buy", "Sell"})
+
+
+def looks_like_exempt_status(stream: dict[str, Any]) -> bool:
+    if stream["value_type"] != "str":
+        return False
+    values = {str(value) for value in stream["values"] if value}
+    return bool(values) and values.issubset({"Exempt", "Non-Exempt"})
+
+
+def looks_like_client_type(stream: dict[str, Any]) -> bool:
+    if stream["value_type"] != "str":
+        return False
+    values = {str(value) for value in stream["values"] if value}
+    return bool(values) and values.issubset({"Institutional", "Retail"})
+
+
+def looks_like_date_serials(stream: dict[str, Any]) -> bool:
+    if stream["value_type"] not in {"double", "int"}:
+        return False
+    traits = stream["traits"]
+    return (
+        traits.get("all_integral")
+        and 30000 <= traits.get("min", 0) <= 60000
+        and 30000 <= traits.get("max", 0) <= 60000
+    )
+
+
+def looks_like_rowcount_markers(stream: dict[str, Any]) -> bool:
+    if stream["value_type"] not in {"double", "int"}:
+        return False
+    traits = stream["traits"]
+    return traits.get("all_integral") and stream["count"] <= 16 and traits.get("max", 0) >= 1000 and not looks_like_date_serials(stream)
+
+
+def dictionary_vector_proximity_bonus(dictionary_stream: dict[str, Any], vector: dict[str, Any]) -> int:
+    return max(0, 40 - abs(vector["offset"] - dictionary_stream["offset"]) // 100000)
+
+
+def looks_like_internal_table_names(stream: dict[str, Any], known_table_names: set[str] | None) -> bool:
+    if stream["value_type"] != "str" or not known_table_names:
+        return False
+    values = {str(value).strip().lower() for value in stream["values"] if value}
+    if not values:
+        return False
+    normalized_table_names = {name.strip().lower() for name in known_table_names if name}
+    overlap = values & normalized_table_names
+    return len(overlap) / len(values) >= 0.7
+
+
+def string_semantic_bonus(field: dict[str, Any], stream: dict[str, Any], known_table_names: set[str] | None = None) -> int:
+    field_name = (field.get("qname") or "").lower()
+    bonus = 0
+
+    if "currency" in field_name:
+        if looks_like_currency_codes(stream):
+            bonus += 220
+        elif looks_like_currency_symbols(stream):
+            bonus += 40
+        else:
+            bonus -= 140
+
+    if "symbol" in field_name:
+        if looks_like_currency_symbols(stream):
+            bonus += 220
+        elif looks_like_currency_codes(stream):
+            bonus += 40
+        else:
+            bonus -= 60
+
+    if field_name == "tax status":
+        if looks_like_exempt_status(stream):
+            bonus += 220
+        if looks_like_client_type(stream):
+            bonus -= 180
+
+    if field_name == "client type":
+        if looks_like_client_type(stream):
+            bonus += 220
+        if looks_like_exempt_status(stream):
+            bonus -= 180
+
+    if field_name == "trade source":
+        if looks_like_trade_source_codes(stream):
+            bonus += 260
+        if looks_like_metric_labels(stream):
+            bonus -= 220
+
+    if field_name in {"tradestatus", "trade status"}:
+        if looks_like_trade_status_values(stream):
+            bonus += 260
+        if looks_like_exempt_status(stream) or looks_like_client_type(stream) or looks_like_buy_sell_values(stream):
+            bonus -= 220
+
+    if field_name == "referral source":
+        if looks_like_internal_table_names(stream, known_table_names):
+            bonus -= 320
+        if looks_like_code_dictionary(stream):
+            bonus -= 140
+        elif stream["traits"].get("space_ratio", 0.0) <= 0.1 and stream["traits"].get("average_length", 0) <= 8:
+            bonus += 60
+
+    if "transactiontype" in field_name or field_name == "transaction type":
+        if looks_like_buy_sell_values(stream):
+            bonus += 260
+        if looks_like_client_type(stream) or looks_like_exempt_status(stream):
+            bonus -= 220
+
+    if "fund code" in field_name or field_name == "%key" or "cusip" in field_name or field_name == "brokercode":
+        if looks_like_code_dictionary(stream):
+            bonus += 180
+            if "org" in field_name and looks_like_org_code_dictionary(stream):
+                bonus += 40
+            if "org" not in field_name and looks_like_org_code_dictionary(stream):
+                bonus -= 20
+        else:
+            bonus -= 140
+
+    if "manager" in field_name and looks_like_people_names(stream):
+        bonus += 180
+
+    if field_name in {"investor", "account name", "fund name", "original fund name", "pooled fund (if applicable)", "securityname", "security name"}:
+        if stream["traits"].get("contains_company_words") or looks_like_people_names(stream) or stream["traits"].get("average_length", 0) >= 10:
+            bonus += 90
+
+    if "location" in field_name:
+        if looks_like_metric_labels(stream):
+            bonus -= 200
+        if looks_like_code_dictionary(stream):
+            bonus += 60
+
+    if "desk" in field_name and looks_like_code_dictionary(stream):
+        bonus -= 80
+
+    return bonus
+
+
+def numeric_semantic_bonus(field: dict[str, Any], stream: dict[str, Any]) -> int:
+    field_name = (field.get("qname") or "").lower()
+    traits = stream["traits"]
+    bonus = 0
+
+    if "date" in field_name or "period" in field_name:
+        if looks_like_date_serials(stream):
+            bonus += 240
+        if looks_like_rowcount_markers(stream):
+            bonus -= 260
+
+    if "price" in field_name:
+        if 0 <= traits.get("average_abs", 0) < 100000 and traits.get("max", 0) < 1000000:
+            bonus += 120
+        if looks_like_date_serials(stream):
+            bonus -= 220
+        if looks_like_rowcount_markers(stream):
+            bonus -= 260
+
+    if "quantity" in field_name:
+        if traits.get("all_integral"):
+            bonus += 50
+        if looks_like_rowcount_markers(stream):
+            bonus -= 180
+
+    if "amount" in field_name or field_name == "value":
+        if traits.get("average_abs", 0) > 1000:
+            bonus += 60
+        if looks_like_rowcount_markers(stream):
+            bonus -= 180
+
+    if field_name.endswith("id") or field_name == "performanceid" or field_name == "trade id":
+        if traits.get("all_integral"):
+            bonus += 120
+
+    return bonus
+
+
 def choose_closest_stream(reference_offset: int, streams: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not streams:
         return None
     return min(streams, key=lambda stream: abs(stream["offset"] - reference_offset))
+
+
+def choose_closest_stream_pair(
+    left_streams: list[dict[str, Any]],
+    right_streams: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]] | tuple[None, None]:
+    if not left_streams or not right_streams:
+        return None, None
+    return min(
+        ((left, right) for left in left_streams for right in right_streams),
+        key=lambda pair: (
+            abs(pair[0]["offset"] - pair[1]["offset"]),
+            max(pair[0]["offset"], pair[1]["offset"]),
+            min(pair[0]["offset"], pair[1]["offset"]),
+        ),
+    )
 
 
 def apply_small_table_reconstruction(
@@ -964,10 +1400,11 @@ def apply_small_table_reconstruction(
     if spec["name"] == "Currency" and fields:
         codes = find_streams(scalar_streams, count=spec["row_count"], value_type="str", predicate=looks_like_currency_codes)
         symbols = find_streams(scalar_streams, count=spec["row_count"], value_type="str", predicate=looks_like_currency_symbols)
-        if codes and symbols:
-            set_column(table_state, fields["_CURRENCY"], codes[0]["values"], "exact", "Exact three-code currency dictionary decoded from a scalar stream.", [codes[0]["offset"]], "scalar_dictionary")
-            set_column(table_state, fields["_SYMBOL"], symbols[0]["values"], "exact", "Exact currency symbol dictionary decoded from a scalar stream.", [symbols[0]["offset"]], "scalar_dictionary")
-            used_offsets.update({codes[0]["offset"], symbols[0]["offset"]})
+        code_stream, symbol_stream = choose_closest_stream_pair(codes, symbols)
+        if code_stream and symbol_stream:
+            set_column(table_state, fields["_CURRENCY"], code_stream["values"], "exact", "Exact three-code currency dictionary decoded from the closest matching scalar stream pair.", [code_stream["offset"]], "scalar_dictionary")
+            set_column(table_state, fields["_SYMBOL"], symbol_stream["values"], "exact", "Exact currency symbol dictionary decoded from the closest matching scalar stream pair.", [symbol_stream["offset"]], "scalar_dictionary")
+            used_offsets.update({code_stream["offset"], symbol_stream["offset"]})
         return used_offsets
 
     if spec["name"] == "Colors" and fields:
@@ -1048,12 +1485,565 @@ def apply_small_table_reconstruction(
     return used_offsets
 
 
+def choose_constant_scalar_value(field: dict[str, Any], scalar_streams: list[dict[str, Any]]) -> Any | None:
+    kind = field_value_kind(field)
+    constant_streams = [stream for stream in scalar_streams if stream["count"] == 1 and scalar_stream_matches_field(field, stream)]
+    if kind == "text":
+        preferred = [stream for stream in constant_streams if stream["values"] and str(stream["values"][0]).strip()]
+        if field["qname"] in {"Trade Trader", "Trade Customer"}:
+            hgi_streams = [stream for stream in preferred if str(stream["values"][0]).strip().upper() == "HGI"]
+            if hgi_streams:
+                return hgi_streams[0]["values"][0]
+        if preferred:
+            return preferred[0]["values"][0]
+        if constant_streams:
+            return constant_streams[0]["values"][0]
+        return None
+
+    if field["qname"] == "PriceAsPercent":
+        return 0
+    if constant_streams:
+        return constant_streams[0]["values"][0]
+    return None
+
+
+def apply_constant_field_reconstruction(
+    spec: dict[str, Any],
+    table_state: dict[str, Any],
+    scalar_streams: list[dict[str, Any]],
+    used_offsets: set[int],
+) -> None:
+    for field in spec["fields"]:
+        field_name = field["qname"]
+        if table_state["confidence"][field_name]["status"] != "missing":
+            continue
+        if int(field.get("qcardinal") or 0) == 0:
+            set_column(
+                table_state,
+                field,
+                [None] * spec["row_count"],
+                "exact",
+                "The field has no stored values in the QVF metadata, so it is exported as a null-filled column.",
+                [],
+                "null_column",
+            )
+            continue
+        if int(field.get("qcardinal") or 0) != 1:
+            continue
+
+        constant_value = choose_constant_scalar_value(field, scalar_streams)
+        if constant_value is None:
+            continue
+
+        values = [constant_value] * spec["row_count"]
+        notes = "A single-value dictionary stream was expanded across the table."
+        status = "exact"
+        if field_value_kind(field) == "numeric" and field_name == "PriceAsPercent":
+            notes = "No dedicated scalar stream was present, so the single-valued numeric column was expanded as a constant zero."
+            status = "heuristic"
+
+        source_offsets = [stream["offset"] for stream in scalar_streams if stream["count"] == 1 and scalar_stream_matches_field(field, stream)]
+        set_column(table_state, field, values, status, notes, source_offsets[:1], "constant_dictionary")
+        if source_offsets:
+            used_offsets.update(source_offsets[:1])
+
+
+def score_relaxed_vector_assignment(
+    field: dict[str, Any],
+    dictionary_stream: dict[str, Any],
+    vector: dict[str, Any],
+    known_table_names: set[str] | None = None,
+) -> tuple[int, str | None]:
+    kind = field_value_kind(field)
+    dictionary_count = int(field.get("qcardinal") or 0)
+
+    if kind == "numeric" and dictionary_stream["value_type"] not in {"double", "int"}:
+        return -1_000_000, None
+    if kind == "text" and dictionary_stream["value_type"] != "str":
+        return -1_000_000, None
+
+    prefer_no_nulls = int(field.get("qtotal_count") or 0) == vector["row_count"] and vector["row_count"] > 0
+    schemes = candidate_index_mapping_schemes(vector, dictionary_count, prefer_no_nulls=prefer_no_nulls)
+    if kind == "text" and "ranked_unique" not in schemes and vector["unique_count"] <= max(3, dictionary_count * 2):
+        schemes.append("ranked_unique")
+    if not schemes:
+        return -1_000_000, None
+    best_scheme = None
+    best_scheme_score = -1_000_000
+    for scheme in schemes:
+        quality_score = scheme_quality_score(field, vector, dictionary_stream["values"], scheme)
+        if quality_score > best_scheme_score:
+            best_scheme = scheme
+            best_scheme_score = quality_score
+    scheme = best_scheme
+    if not scheme:
+        return -1_000_000, None
+
+    dictionary_distance = min(
+        abs(vector["unique_count"] - dictionary_count),
+        abs((vector["unique_count"] - 1) - dictionary_count),
+        abs(vector["max"] - dictionary_count),
+        abs((vector["max"] - 1) - dictionary_count),
+        abs((vector["max"] + 1) - dictionary_count),
+    )
+    max_distance = max(1, int(dictionary_count * (0.35 if is_key_field(field) else 0.25)))
+    if dictionary_distance > max_distance:
+        return -1_000_000, None
+
+    score = 400
+    score -= dictionary_distance * (2 if is_key_field(field) else 5)
+    if vector["best_distance"] == 0:
+        score += 60
+    if vector["unique_count"] == dictionary_count:
+        score += 50
+    elif vector["unique_count"] <= dictionary_count:
+        score += 20
+    elif vector["unique_count"] <= dictionary_count * 2:
+        score += 10
+    if vector["max"] == dictionary_count - 1:
+        score += 25
+    elif vector["max"] == dictionary_count:
+        score += 15
+    elif vector["max"] == dictionary_count + 1:
+        score += 10
+    if vector["bits_per_value"] in {8, 16}:
+        score += 10
+
+    field_name = field["qname"].lower()
+    if kind == "text" and ("code" in field_name or "key" in field_name):
+        score += 10
+    if kind == "numeric" and any(token in field_name for token in ["amount", "price", "value", "quantity", "percent", "year"]):
+        score += 10
+    if kind == "text":
+        score += string_semantic_bonus(field, dictionary_stream, known_table_names=known_table_names)
+    else:
+        score += numeric_semantic_bonus(field, dictionary_stream)
+    score += best_scheme_score
+
+    return score, scheme
+
+
+def apply_relaxed_field_reconstruction(
+    spec: dict[str, Any],
+    table_state: dict[str, Any],
+    scalar_streams: list[dict[str, Any]],
+    index_vectors: list[dict[str, Any]],
+    used_offsets: set[int],
+    known_table_names: set[str] | None = None,
+) -> None:
+    table_vectors = [vector for vector in index_vectors if vector["table"] == spec["name"]]
+
+    for field in spec["fields"]:
+        field_name = field["qname"]
+        if table_state["confidence"][field_name]["status"] != "missing":
+            continue
+
+        field_kind = field_value_kind(field)
+        dictionary_streams = [
+            stream
+            for stream in scalar_streams
+            if stream["count"] == int(field.get("qcardinal") or 0) and scalar_stream_matches_field(field, stream)
+        ]
+        add_candidate_offsets(table_state, field_name, [stream["offset"] for stream in dictionary_streams])
+
+        direct_numeric_candidate = None
+        if field_kind == "numeric" and not dictionary_streams:
+            exact_vectors = [
+                vector
+                for vector in table_vectors
+                if vector["unique_count"] == int(field.get("qcardinal") or 0)
+                and vector["best_distance"] == 0
+                and vector["max"] == int(field.get("qcardinal") or 0) - 1
+            ]
+            if exact_vectors:
+                direct_numeric_candidate = min(exact_vectors, key=lambda item: (item["best_distance"], item["offset"]))
+
+        if direct_numeric_candidate:
+            values = direct_numeric_candidate["values"]
+            notes = (
+                "Direct packed numeric values were recovered from a zlib vector with an exact cardinality match. "
+                f"Source offset {direct_numeric_candidate['offset']}."
+            )
+            set_column(
+                table_state,
+                field,
+                values,
+                "exact",
+                notes,
+                [direct_numeric_candidate["offset"]],
+                "direct_numeric_vector",
+            )
+            continue
+
+        if field_kind == "numeric" and not dictionary_streams:
+            relaxed_numeric_candidates = sorted(
+                table_vectors,
+                key=lambda item: (
+                    item["best_distance"],
+                    abs(item["unique_count"] - int(field.get("qcardinal") or 0)),
+                    item["offset"],
+                ),
+            )
+            if relaxed_numeric_candidates:
+                direct_numeric_candidate = relaxed_numeric_candidates[0]
+                if direct_numeric_candidate["best_distance"] <= max(10, int((field.get("qcardinal") or 0) * 0.3)):
+                    values = direct_numeric_candidate["values"]
+                    notes = (
+                        "A packed numeric vector without a matching dictionary stream was assigned directly. "
+                        f"Source offset {direct_numeric_candidate['offset']}."
+                    )
+                    status = "exact" if direct_numeric_candidate["best_distance"] == 0 else "heuristic"
+                    set_column(
+                        table_state,
+                        field,
+                        values,
+                        status,
+                        notes,
+                        [direct_numeric_candidate["offset"]],
+                        "direct_numeric_vector",
+                    )
+                    continue
+
+        candidates: list[tuple[int, dict[str, Any], dict[str, Any], str]] = []
+        for dictionary_stream in dictionary_streams:
+            for vector in table_vectors:
+                if vector["offset"] in used_offsets:
+                    continue
+                score, scheme = score_relaxed_vector_assignment(field, dictionary_stream, vector, known_table_names=known_table_names)
+                if score > -1_000_000 and scheme:
+                    candidates.append((score, dictionary_stream, vector, scheme))
+
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda item: (-item[0], item[2]["offset"], item[1]["offset"]))
+        score, dictionary_stream, vector, scheme = candidates[0]
+        if table_state["confidence"][field_name]["status"] != "missing":
+            continue
+
+        decoded_values = decode_indexed_values(vector, dictionary_stream["values"], scheme)
+        if not any(value is not None for value in decoded_values):
+            continue
+
+        status = "exact" if vector["best_distance"] == 0 and scheme in {"zero_based", "one_based"} else "heuristic"
+        notes = (
+            f"Relaxed dictionary-index reconstruction using {vector['bits_per_value']}-bit values with {vector['header_bytes']} header bytes. "
+            f"Dictionary stream at offset {dictionary_stream['offset']} and index vector at offset {vector['offset']}."
+        )
+        if scheme == "ranked_unique":
+            notes += " The decoded values use ranked unique codes because the stream appears to contain a subset of the dictionary."
+        elif scheme == "zero_null_one_based_fill_zero":
+            notes += " Metadata shows the field is populated on every row, so index value 0 is mapped to the first dictionary value instead of null."
+        if is_key_field(field):
+            notes += " The field is key-like, so text dictionaries are allowed even when the source metadata marks it numeric."
+
+        set_column(
+            table_state,
+            field,
+            decoded_values,
+            status,
+            notes,
+            [dictionary_stream["offset"], vector["offset"]],
+            "relaxed_dictionary_index_vector",
+        )
+        table_state["mapping"][field_name].append(
+            {
+                "method": "relaxed_dictionary_index_vector",
+                "dictionary_offset": dictionary_stream["offset"],
+                "vector_offset": vector["offset"],
+                "bits_per_value": vector["bits_per_value"],
+                "header_bytes": vector["header_bytes"],
+                "scheme": scheme,
+                "score": score,
+            }
+        )
+        used_offsets.add(vector["offset"])
+        used_offsets.add(dictionary_stream["offset"])
+
+
+def candidate_index_mapping_schemes(vector: dict[str, Any], dictionary_count: int, prefer_no_nulls: bool = False) -> list[str]:
+    unique_values = set(vector["unique_values"])
+    min_value = vector["min"]
+    max_value = vector["max"]
+    slack = max(2, int(dictionary_count * 0.08))
+    schemes: list[str] = []
+
+    if min_value >= 0 and max_value <= dictionary_count - 1:
+        schemes.append("zero_based")
+    if min_value >= 1 and max_value <= dictionary_count:
+        schemes.append("one_based")
+    if 0 in unique_values and max_value <= dictionary_count:
+        non_zero = {value for value in unique_values if value != 0}
+        if non_zero and min(non_zero) >= 1:
+            schemes.append("zero_null_one_based")
+            if prefer_no_nulls:
+                schemes.append("zero_null_one_based_fill_zero")
+    if prefer_no_nulls and 0 in unique_values and max_value <= dictionary_count + 1:
+        non_zero = {value for value in unique_values if value != 0}
+        if non_zero and min(non_zero) >= 1:
+            schemes.append("zero_null_one_based_fill_zero")
+    if 0 in unique_values and 1 not in unique_values and max_value <= dictionary_count + 1:
+        non_reserved = {value for value in unique_values if value not in {0, 1}}
+        if not non_reserved or min(non_reserved) >= 2:
+            schemes.append("zero_null_skip_one")
+    if len(unique_values) <= dictionary_count + slack:
+        schemes.append("ranked_unique")
+    if 0 in unique_values and len(unique_values) - 1 <= dictionary_count + slack:
+        schemes.append("ranked_unique_null_zero")
+    return list(dict.fromkeys(schemes))
+
+
+def infer_index_mapping_scheme(vector: dict[str, Any], dictionary_count: int, prefer_no_nulls: bool = False) -> str | None:
+    schemes = candidate_index_mapping_schemes(vector, dictionary_count, prefer_no_nulls=prefer_no_nulls)
+    return schemes[0] if schemes else None
+
+
+def scheme_quality_score(
+    field: dict[str, Any],
+    vector: dict[str, Any],
+    dictionary_values: list[Any],
+    scheme: str,
+) -> int:
+    decoded = decode_indexed_values(vector, dictionary_values, scheme)
+    non_null = [value for value in decoded if value is not None]
+    non_null_count = len(non_null)
+    decoded_unique_count = len(set(non_null))
+    row_count = vector["row_count"]
+    field_total_count = int(field.get("qtotal_count") or 0)
+    field_cardinality = int(field.get("qcardinal") or 0)
+    prefer_no_nulls = field_total_count == row_count and row_count > 0
+
+    score = 0
+    if field_total_count > 0:
+        score -= abs(non_null_count - field_total_count) * (3 if field_total_count <= 2000 else 1)
+        if non_null_count == field_total_count:
+            score += 140
+        elif non_null_count >= field_total_count * 0.98:
+            score += 60
+    else:
+        score += int((non_null_count / max(1, row_count)) * 40)
+
+    if field_cardinality > 0:
+        score -= abs(decoded_unique_count - field_cardinality) * 12
+        if decoded_unique_count == field_cardinality:
+            score += 140
+        elif abs(decoded_unique_count - field_cardinality) <= 1:
+            score += 50
+
+    if scheme in {"zero_based", "one_based"}:
+        score += 25
+    elif scheme in {"zero_null_one_based", "zero_null_skip_one"}:
+        score += 10
+    elif scheme == "zero_null_one_based_fill_zero":
+        score += 20 if prefer_no_nulls else -20
+    elif scheme == "ranked_unique":
+        score -= 10
+    elif scheme == "ranked_unique_null_zero":
+        score -= 25
+
+    if prefer_no_nulls and non_null_count == row_count:
+        score += 90
+    if not prefer_no_nulls and "fill_zero" in scheme:
+        score -= 40
+
+    return score
+
+
+def decode_indexed_values(vector: dict[str, Any], dictionary_values: list[Any], scheme: str) -> list[Any]:
+    if scheme == "ranked_unique":
+        ordered_codes = sorted(set(vector["values"]))
+        mapping = {code: dictionary_values[index] for index, code in enumerate(ordered_codes[: len(dictionary_values)])}
+        return [mapping.get(value) for value in vector["values"]]
+    if scheme == "ranked_unique_null_zero":
+        ordered_codes = sorted(code for code in set(vector["values"]) if code != 0)
+        mapping = {0: None}
+        mapping.update({code: dictionary_values[index] for index, code in enumerate(ordered_codes[: len(dictionary_values)])})
+        return [mapping.get(value) for value in vector["values"]]
+
+    decoded: list[Any] = []
+    for value in vector["values"]:
+        if scheme == "zero_based":
+            decoded.append(dictionary_values[value] if 0 <= value < len(dictionary_values) else None)
+        elif scheme == "one_based":
+            decoded.append(dictionary_values[value - 1] if 1 <= value <= len(dictionary_values) else None)
+        elif scheme == "zero_null_one_based":
+            decoded.append(None if value == 0 else dictionary_values[value - 1] if 1 <= value <= len(dictionary_values) else None)
+        elif scheme == "zero_null_one_based_fill_zero":
+            decoded.append(dictionary_values[0] if value == 0 and dictionary_values else dictionary_values[value - 1] if 1 <= value <= len(dictionary_values) else None)
+        elif scheme == "zero_null_skip_one":
+            decoded.append(None if value in {0, 1} else dictionary_values[value - 2] if 2 <= value <= len(dictionary_values) + 1 else None)
+        else:
+            decoded.append(None)
+    return decoded
+
+
+def score_index_vector_assignment(
+    field: dict[str, Any],
+    dictionary_stream: dict[str, Any],
+    vector: dict[str, Any],
+    known_table_names: set[str] | None = None,
+) -> tuple[int, str | None]:
+    kind = field_value_kind(field)
+    if kind == "numeric" and dictionary_stream["value_type"] not in {"double", "int"}:
+        return -1_000_000, None
+    if kind == "text" and dictionary_stream["value_type"] != "str":
+        return -1_000_000, None
+
+    dictionary_count = dictionary_stream["count"]
+    field_cardinality = int(field.get("qcardinal") or 0)
+    if field_cardinality and dictionary_count != field_cardinality:
+        return -1_000_000, None
+
+    prefer_no_nulls = int(field.get("qtotal_count") or 0) == vector["row_count"] and vector["row_count"] > 0
+    schemes = candidate_index_mapping_schemes(vector, dictionary_count, prefer_no_nulls=prefer_no_nulls)
+    if not schemes:
+        return -1_000_000, None
+    best_scheme = None
+    best_scheme_score = -1_000_000
+    for scheme in schemes:
+        quality_score = scheme_quality_score(field, vector, dictionary_stream["values"], scheme)
+        if quality_score > best_scheme_score:
+            best_scheme = scheme
+            best_scheme_score = quality_score
+    scheme = best_scheme
+    if not scheme:
+        return -1_000_000, None
+
+    dictionary_distance = min(
+        abs(vector["unique_count"] - dictionary_count),
+        abs((vector["unique_count"] - 1) - dictionary_count),
+        abs(vector["max"] - dictionary_count),
+        abs((vector["max"] - 1) - dictionary_count),
+        abs((vector["max"] + 1) - dictionary_count),
+    )
+    max_distance = max(1, int(dictionary_count * (0.35 if is_key_field(field) else 0.15)))
+    if dictionary_distance > max_distance:
+        return -1_000_000, None
+
+    score = 200
+    score -= dictionary_distance * (2 if is_key_field(field) else 8)
+    if vector["best_cardinality"] == dictionary_count:
+        score += 60
+    if vector["best_distance"] == 0:
+        score += 30
+    if vector["unique_count"] == dictionary_count:
+        score += 40
+    elif vector["unique_count"] == dictionary_count + 1:
+        score += 30
+    if vector["max"] == dictionary_count - 1:
+        score += 25
+    elif vector["max"] == dictionary_count:
+        score += 15
+    elif vector["max"] == dictionary_count + 1:
+        score += 10
+
+    field_name = field["qname"].lower()
+    if kind == "text" and "code" in field_name:
+        score += 10
+    if kind == "numeric" and dictionary_stream["value_type"] in {"double", "int"} and any(token in field_name for token in ["amount", "price", "fundsize", "%", "year"]):
+        score += 10
+    if vector["bits_per_value"] in {8, 16}:
+        score += 10
+    if kind == "text":
+        score += string_semantic_bonus(field, dictionary_stream, known_table_names=known_table_names)
+    else:
+        score += numeric_semantic_bonus(field, dictionary_stream)
+    score += best_scheme_score
+
+    return score, scheme
+
+
+def apply_index_vector_reconstruction(
+    spec: dict[str, Any],
+    table_state: dict[str, Any],
+    scalar_streams: list[dict[str, Any]],
+    index_vectors: list[dict[str, Any]],
+    used_offsets: set[int],
+    known_table_names: set[str] | None = None,
+) -> None:
+    table_vectors = [vector for vector in index_vectors if vector["table"] == spec["name"]]
+    candidates: list[tuple[int, dict[str, Any], dict[str, Any], dict[str, Any], str]] = []
+
+    for field in spec["fields"]:
+        field_name = field["qname"]
+        if table_state["confidence"][field_name]["status"] != "missing":
+            continue
+
+        dictionary_streams = [
+            stream
+            for stream in scalar_streams
+            if stream["count"] == int(field.get("qcardinal") or 0)
+            and scalar_stream_matches_field(field, stream)
+        ]
+        add_candidate_offsets(table_state, field_name, [stream["offset"] for stream in dictionary_streams])
+
+        for dictionary_stream in dictionary_streams:
+            for vector in table_vectors:
+                if vector["offset"] in used_offsets:
+                    continue
+                score, scheme = score_index_vector_assignment(field, dictionary_stream, vector, known_table_names=known_table_names)
+                if score > 0 and scheme:
+                    candidates.append((score, field, dictionary_stream, vector, scheme))
+
+    used_vector_offsets: set[int] = set()
+    used_dictionary_offsets: set[int] = set()
+    candidates.sort(key=lambda item: (-item[0], item[3]["offset"], item[2]["offset"], item[1]["qname"]))
+
+    for score, field, dictionary_stream, vector, scheme in candidates:
+        field_name = field["qname"]
+        if table_state["confidence"][field_name]["status"] != "missing":
+            continue
+        if vector["offset"] in used_vector_offsets or dictionary_stream["offset"] in used_dictionary_offsets:
+            continue
+
+        decoded_values = decode_indexed_values(vector, dictionary_stream["values"], scheme)
+        coverage = sum(value is not None for value in decoded_values)
+        if coverage == 0:
+            continue
+
+        status = "exact" if vector["best_distance"] == 0 and scheme in {"zero_based", "one_based"} else "heuristic"
+        notes = (
+            f"Dictionary-index reconstruction using {vector['bits_per_value']}-bit values with {vector['header_bytes']} header bytes. "
+            f"Dictionary stream at offset {dictionary_stream['offset']} and index vector at offset {vector['offset']}."
+        )
+        if scheme == "zero_null_skip_one":
+            notes += " Index value 0 is treated as null and 1 is reserved/unused."
+        elif scheme == "zero_null_one_based":
+            notes += " Index value 0 is treated as null."
+        elif scheme == "zero_null_one_based_fill_zero":
+            notes += " Metadata shows the field is populated on every row, so index value 0 is mapped to the first dictionary value instead of null."
+
+        set_column(
+            table_state,
+            field,
+            decoded_values,
+            status,
+            notes,
+            [dictionary_stream["offset"], vector["offset"]],
+            "dictionary_index_vector",
+        )
+        table_state["mapping"][field_name].append(
+            {
+                "method": "dictionary_index_vector",
+                "dictionary_offset": dictionary_stream["offset"],
+                "vector_offset": vector["offset"],
+                "bits_per_value": vector["bits_per_value"],
+                "header_bytes": vector["header_bytes"],
+                "scheme": scheme,
+                "score": score,
+            }
+        )
+        used_vector_offsets.add(vector["offset"])
+        used_dictionary_offsets.add(dictionary_stream["offset"])
+        used_offsets.add(vector["offset"])
+
+
 def score_row_stream(field: dict[str, Any], stream: dict[str, Any], row_count: int) -> int:
     if stream["count"] != row_count:
         return -1_000_000
-    if is_numeric_field(field) and stream["value_type"] not in {"double", "int"}:
+    if field_value_kind(field) == "numeric" and stream["value_type"] not in {"double", "int"}:
         return -1_000_000
-    if not is_numeric_field(field) and stream["value_type"] != "str":
+    if field_value_kind(field) == "text" and stream["value_type"] != "str":
         return -1_000_000
 
     field_name = field["qname"].lower()
@@ -1074,7 +2064,7 @@ def score_row_stream(field: dict[str, Any], stream: dict[str, Any], row_count: i
     if "$key" in (field.get("qtags") or []) and field_total_count == 0 and 0 < field_cardinality < row_count:
         score -= 120
 
-    if is_numeric_field(field):
+    if field_value_kind(field) == "numeric":
         if "id" in field_name and traits.get("all_integral"):
             score += 40
             if traits.get("is_monotonic_non_decreasing"):
@@ -1093,6 +2083,13 @@ def score_row_stream(field: dict[str, Any], stream: dict[str, Any], row_count: i
             score += 10
         if "cusip" in field_name:
             score -= 200
+        if "quantity" in field_name and unique_count == row_count and field_cardinality != row_count:
+            score -= 180
+        if ("price" in field_name or "amount" in field_name or field_name == "value") and unique_count == row_count and field_cardinality != row_count:
+            score -= 120
+        if ("date" in field_name or "period" in field_name) and not looks_like_date_serials(stream):
+            score -= 180
+        score += numeric_semantic_bonus(field, stream)
     else:
         average_length = traits.get("average_length", 0)
         if "currency" in field_name and traits.get("all_upper_alpha"):
@@ -1107,6 +2104,7 @@ def score_row_stream(field: dict[str, Any], stream: dict[str, Any], row_count: i
             score += 18
         if "status" in field_name and average_length < 16:
             score += 8
+        score += string_semantic_bonus(field, stream)
     return score
 
 
@@ -1115,6 +2113,7 @@ def apply_general_rowwise_reconstruction(
     table_state: dict[str, Any],
     scalar_streams: list[dict[str, Any]],
     used_offsets: set[int],
+    known_table_names: set[str] | None = None,
 ) -> None:
     candidate_pairs: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
 
@@ -1128,8 +2127,8 @@ def apply_general_rowwise_reconstruction(
             for stream in scalar_streams
             if stream["count"] == field.get("qcardinal")
             and (
-                (is_numeric_field(field) and stream["value_type"] in {"double", "int"})
-                or (not is_numeric_field(field) and stream["value_type"] == "str")
+                (field_value_kind(field) == "numeric" and stream["value_type"] in {"double", "int"})
+                or (field_value_kind(field) == "text" and stream["value_type"] == "str")
             )
         ]
         add_candidate_offsets(table_state, field_name, candidate_offsets)
@@ -1172,6 +2171,8 @@ def apply_general_rowwise_reconstruction(
 
 
 def compute_table_status(confidence: dict[str, dict[str, Any]]) -> str:
+    if not confidence:
+        return "exact"
     statuses = {item["status"] for item in confidence.values()} if confidence else {"missing"}
     if statuses == {"exact"}:
         return "exact"
@@ -1186,30 +2187,223 @@ def compute_table_status(confidence: dict[str, dict[str, Any]]) -> str:
     return "partial"
 
 
+def build_manifest_rows(
+    specs: list[dict[str, Any]],
+    confidence_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    manifest_rows: list[dict[str, Any]] = []
+    for spec in specs:
+        confidence = confidence_payload[spec["name"]]
+        filled_columns = sum(item["status"] != "missing" for item in confidence.values())
+        source_offsets = sorted(
+            {
+                offset
+                for item in confidence.values()
+                for offset in item.get("source_block_offsets", [])
+            }
+        )
+        manifest_rows.append(
+            {
+                "table": spec["name"],
+                "expected_row_count": spec["row_count"],
+                "exported_row_count": spec["row_count"] if spec["fields"] else 0,
+                "total_columns": len(spec["fields"]),
+                "exported_columns": filled_columns,
+                "status": compute_table_status(confidence),
+                "source_block_offsets": source_offsets,
+                "files": {
+                    "parquet": f"tables/{spec['name']}.parquet",
+                    "tsv": f"tables/{spec['name']}.tsv",
+                },
+            }
+        )
+    return manifest_rows
+
+
+def build_exact_currency_lookup(
+    table_payload: dict[str, Any],
+    confidence_payload: dict[str, Any],
+) -> tuple[dict[str, str | None], list[int]]:
+    currency_payload = table_payload.get("Currency")
+    currency_confidence = confidence_payload.get("Currency", {})
+    if not currency_payload or "_CURRENCY" not in currency_payload["columns"] or "_SYMBOL" not in currency_payload["columns"]:
+        return {}, []
+    if currency_confidence.get("_CURRENCY", {}).get("status") != "exact":
+        return {}, []
+    if currency_confidence.get("_SYMBOL", {}).get("status") != "exact":
+        return {}, []
+
+    codes = currency_payload["columns"]["_CURRENCY"]
+    symbols = currency_payload["columns"]["_SYMBOL"]
+    lookup = {
+        code: symbol
+        for code, symbol in zip(codes, symbols)
+        if code not in {None, ""}
+    }
+    source_offsets = sorted(
+        {
+            *currency_confidence.get("_CURRENCY", {}).get("source_block_offsets", []),
+            *currency_confidence.get("_SYMBOL", {}).get("source_block_offsets", []),
+        }
+    )
+    return lookup, source_offsets
+
+
+def corresponding_currency_field_name(symbol_field_name: str, available_fields: set[str]) -> str | None:
+    if "symbol" not in symbol_field_name.lower():
+        return None
+    direct_candidate = re.sub(r"symbol", "Currency", symbol_field_name, count=1, flags=re.IGNORECASE)
+    if direct_candidate in available_fields:
+        return direct_candidate
+    lowered = {name.lower(): name for name in available_fields}
+    lowered_candidate = symbol_field_name.lower().replace("symbol", "currency", 1)
+    return lowered.get(lowered_candidate)
+
+
+def apply_currency_symbol_postprocessing(
+    table_payload: dict[str, Any],
+    confidence_payload: dict[str, Any],
+    mapping_payload: dict[str, Any],
+) -> None:
+    currency_lookup, lookup_offsets = build_exact_currency_lookup(table_payload, confidence_payload)
+    if not currency_lookup:
+        return
+
+    for table_name, payload in table_payload.items():
+        available_fields = {field["qname"] for field in payload["fields"]}
+        for field in payload["fields"]:
+            field_name = field["qname"]
+            if "symbol" not in field_name.lower():
+                continue
+
+            currency_field_name = corresponding_currency_field_name(field_name, available_fields)
+            if not currency_field_name:
+                continue
+
+            currency_values = payload["columns"].get(currency_field_name)
+            if currency_values is None:
+                continue
+
+            current_values = payload["columns"].get(field_name, [])
+            known_pairs = [
+                (code, symbol)
+                for code, symbol in zip(currency_values, current_values)
+                if code in currency_lookup and symbol not in {None, ""}
+            ]
+            if not known_pairs:
+                continue
+
+            mismatches = sum(symbol != currency_lookup.get(code) for code, symbol in known_pairs)
+            by_currency: dict[str, set[str]] = {}
+            for code, symbol in known_pairs:
+                by_currency.setdefault(str(code), set()).add(str(symbol))
+            inconsistent = any(len(symbols) > 1 for symbols in by_currency.values())
+            if mismatches == 0 and not inconsistent:
+                continue
+
+            derived_values = [currency_lookup.get(code) or STANDARD_CURRENCY_SYMBOLS.get(str(code)) for code in currency_values]
+            payload["columns"][field_name] = derived_values
+
+            source_offsets = sorted(
+                {
+                    *lookup_offsets,
+                    *confidence_payload[table_name].get(currency_field_name, {}).get("source_block_offsets", []),
+                }
+            )
+            confidence_payload[table_name][field_name] = {
+                "status": "heuristic",
+                "coverage_ratio": 1.0,
+                "inferred_type": "string",
+                "notes": (
+                    f"Derived from the exact Currency lookup table using '{currency_field_name}' because the directly decoded symbol stream did not map consistently to known currency codes. "
+                    "Currencies absent from the lookup fall back to a small built-in ISO symbol map when available; otherwise they are exported as null."
+                ),
+                "source_block_offsets": source_offsets,
+                "candidate_dictionary_offsets": confidence_payload[table_name][field_name].get("candidate_dictionary_offsets", []),
+            }
+            mapping_payload[table_name][field_name].append(
+                {
+                    "method": "currency_lookup_derivation",
+                    "currency_field": currency_field_name,
+                    "lookup_table": "Currency",
+                    "lookup_source_block_offsets": lookup_offsets,
+                    "status": "heuristic",
+                }
+            )
+
+
+def parse_temporal_format_hints(script: str) -> dict[str, str]:
+    hints: dict[str, str] = {}
+    pattern = re.compile(
+        r"Date\s*\(.*?,\s*'([^']+)'\s*\)\s+as\s+\"([^\"]+)\"",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(script):
+        qlik_format, field_name = match.groups()
+        hints[field_name] = qlik_format
+    return hints
+
+
+def qlik_datetime_from_serial(value: Any) -> datetime | None:
+    if value in {None, ""}:
+        return None
+    return QLIK_EPOCH + timedelta(days=float(value))
+
+
+def qlik_format_to_strftime(qlik_format: str) -> str:
+    mapping = {
+        "YYYY": "%Y",
+        "MMM": "%b",
+        "MM": "%m",
+        "DD": "%d",
+        "hh": "%H",
+        "mm": "%M",
+        "ss": "%S",
+    }
+    result = qlik_format
+    for token in sorted(mapping, key=len, reverse=True):
+        result = result.replace(token, mapping[token])
+    return result
+
+
+def format_temporal_value(field: dict[str, Any], value: Any, temporal_hints: dict[str, str]) -> Any:
+    if value in {None, ""} or field_value_kind(field) != "numeric":
+        return value
+
+    tags = set(field.get("qtags") or [])
+    if "$date" not in tags and "$timestamp" not in tags:
+        return value
+
+    dt = qlik_datetime_from_serial(value)
+    if dt is None:
+        return value
+
+    explicit_format = temporal_hints.get(field["qname"])
+    if explicit_format:
+        return dt.strftime(qlik_format_to_strftime(explicit_format))
+    if "$timestamp" in tags and not (is_integer_field(field) and float(value).is_integer()):
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.date().isoformat()
+
+
 def finalize_table_exports(
     specs: list[dict[str, Any]],
     scalar_streams: list[dict[str, Any]],
+    index_vectors: list[dict[str, Any]],
     script: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     tables_dir_payload: dict[str, Any] = {}
-    manifest_rows: list[dict[str, Any]] = []
     confidence_payload: dict[str, Any] = {}
     mapping_payload: dict[str, Any] = {}
+    known_table_names = {spec["name"] for spec in specs}
 
     for spec in specs:
         table_state = create_empty_table_state(spec)
         used_offsets = apply_small_table_reconstruction(spec, table_state, scalar_streams, script)
-        apply_general_rowwise_reconstruction(spec, table_state, scalar_streams, used_offsets)
-
-        status = compute_table_status(table_state["confidence"])
-        filled_columns = sum(item["status"] != "missing" for item in table_state["confidence"].values())
-        source_offsets = sorted(
-            {
-                offset
-                for item in table_state["confidence"].values()
-                for offset in item.get("source_block_offsets", [])
-            }
-        )
+        apply_index_vector_reconstruction(spec, table_state, scalar_streams, index_vectors, used_offsets, known_table_names=known_table_names)
+        apply_constant_field_reconstruction(spec, table_state, scalar_streams, used_offsets)
+        apply_relaxed_field_reconstruction(spec, table_state, scalar_streams, index_vectors, used_offsets, known_table_names=known_table_names)
+        apply_general_rowwise_reconstruction(spec, table_state, scalar_streams, used_offsets, known_table_names=known_table_names)
 
         tables_dir_payload[spec["name"]] = {
             "columns": table_state["columns"],
@@ -1218,26 +2412,14 @@ def finalize_table_exports(
         }
         confidence_payload[spec["name"]] = table_state["confidence"]
         mapping_payload[spec["name"]] = table_state["mapping"]
-        manifest_rows.append(
-            {
-                "table": spec["name"],
-                "expected_row_count": spec["row_count"],
-                "exported_row_count": spec["row_count"] if spec["fields"] else 0,
-                "total_columns": len(spec["fields"]),
-                "exported_columns": filled_columns,
-                "status": status,
-                "source_block_offsets": source_offsets,
-                "files": {
-                    "parquet": f"tables/{spec['name']}.parquet",
-                    "tsv": f"tables/{spec['name']}.tsv",
-                },
-            }
-        )
-
+    apply_currency_symbol_postprocessing(tables_dir_payload, confidence_payload, mapping_payload)
+    manifest_rows = build_manifest_rows(specs, confidence_payload)
     return tables_dir_payload, manifest_rows, confidence_payload, mapping_payload
 
 
-def write_tsv(path: Path, field_order: list[str], columns: dict[str, list[Any]], row_count: int) -> None:
+def write_tsv(path: Path, fields: list[dict[str, Any]], columns: dict[str, list[Any]], row_count: int, temporal_hints: dict[str, str]) -> None:
+    field_order = [field["qname"] for field in fields]
+    fields_by_name = {field["qname"]: field for field in fields}
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
         if field_order:
@@ -1246,7 +2428,8 @@ def write_tsv(path: Path, field_order: list[str], columns: dict[str, list[Any]],
             row = []
             for field_name in field_order:
                 value = columns[field_name][row_index]
-                row.append("" if value is None else value)
+                formatted = format_temporal_value(fields_by_name[field_name], value, temporal_hints)
+                row.append("" if formatted is None else formatted)
             if field_order:
                 writer.writerow(row)
 
@@ -1255,7 +2438,7 @@ def arrow_array_for_field(field: dict[str, Any], values: list[Any]) -> Any:
     if pa is None:
         raise RuntimeError("pyarrow is required for Parquet export. Install requirements.txt first.")
 
-    if not is_numeric_field(field):
+    if field_value_kind(field) != "numeric":
         return pa.array(values, type=pa.string())
 
     if is_integer_field(field):
@@ -1278,12 +2461,18 @@ def write_parquet(path: Path, fields: list[dict[str, Any]], columns: dict[str, l
     pq.write_table(table, path)
 
 
-def write_table_outputs(output_dir: Path, table_payload: dict[str, Any]) -> None:
+def write_table_outputs(output_dir: Path, table_payload: dict[str, Any], temporal_hints: dict[str, str]) -> None:
     tables_dir = output_dir / "tables"
     ensure_dir(tables_dir)
     for table_name, payload in table_payload.items():
         field_order = [field["qname"] for field in payload["fields"]]
-        write_tsv(tables_dir / f"{table_name}.tsv", field_order, payload["columns"], payload["row_count"] if field_order else 0)
+        write_tsv(
+            tables_dir / f"{table_name}.tsv",
+            payload["fields"],
+            payload["columns"],
+            payload["row_count"] if field_order else 0,
+            temporal_hints,
+        )
         write_parquet(tables_dir / f"{table_name}.parquet", payload["fields"], payload["columns"])
 
 
@@ -1381,6 +2570,9 @@ def main() -> int:
     opaque_rows.extend(binary_unknowns)
     table_specs = build_table_specs(summary["data_model_metadata"])
     non_scalar_streams = classify_non_scalar_streams(blob, format_blocks, table_specs)
+    index_vectors = discover_index_vectors(blob, format_blocks, table_specs)
+
+    temporal_hints = parse_temporal_format_hints(summary["script"])
 
     if args.skip_tables:
         table_payload = {}
@@ -1391,6 +2583,7 @@ def main() -> int:
         table_payload, table_manifest, table_confidence, table_mapping = finalize_table_exports(
             table_specs,
             scalar_streams,
+            index_vectors,
             summary["script"],
         )
 
@@ -1403,6 +2596,7 @@ def main() -> int:
         "decoded_object_count": len(decoded_objects),
         "scalar_stream_count": len(scalar_streams),
         "non_scalar_stream_count": len(non_scalar_streams),
+        "index_vector_count": len(index_vectors),
         "block_type_counts": dict(
             sorted(
                 Counter(
@@ -1443,6 +2637,21 @@ def main() -> int:
     jsonl_dump(raw_dir / "decoded-objects.jsonl", decoded_objects)
     json_dump(raw_dir / "unknown-blocks.json", opaque_rows)
     json_dump(raw_dir / "non-scalar-streams.json", non_scalar_streams)
+    json_dump(raw_dir / "index-vectors.json", [
+        {
+            "offset": vector["offset"],
+            "table": vector["table"],
+            "row_count": vector["row_count"],
+            "bits_per_value": vector["bits_per_value"],
+            "header_bytes": vector["header_bytes"],
+            "min": vector["min"],
+            "max": vector["max"],
+            "unique_count": vector["unique_count"],
+            "best_cardinality": vector["best_cardinality"],
+            "best_distance": vector["best_distance"],
+        }
+        for vector in index_vectors
+    ])
     json_dump(raw_dir / "scalar-streams.json", [
         {
             "offset": stream["offset"],
@@ -1455,7 +2664,7 @@ def main() -> int:
         for stream in scalar_streams
     ])
     if not args.skip_tables:
-        write_table_outputs(output_dir, table_payload)
+        write_table_outputs(output_dir, table_payload, temporal_hints)
         json_dump(output_dir / "tables" / "_manifest.json", table_manifest)
         json_dump(output_dir / "tables" / "_confidence.json", table_confidence)
         json_dump(raw_dir / "table-block-mapping.json", table_mapping)
