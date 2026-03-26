@@ -136,6 +136,7 @@ TMP_ROOT=./runtime/tmp
 JOB_TTL_MINUTES=30
 QLIK_BIN=./bin/qlik
 ENGINE_CONTAINER_NAME=qlik-engine
+KEEP_FAILED_JOBS=false
 ```
 
 ## 🗂️ Temporary Data And Cleanup
@@ -148,6 +149,14 @@ Cleanup happens in two ways:
 - periodically for stale job folders older than the configured TTL
 
 This keeps the service aligned with temporary processing rather than file retention.
+
+If you need to inspect failed imports, set:
+
+```env
+KEEP_FAILED_JOBS=true
+```
+
+When enabled, failed job folders are preserved under `runtime/tmp/jobs/<job-id>/` together with a `failure-report.txt` file for debugging.
 
 ## 🧷 Engine Image Retention
 

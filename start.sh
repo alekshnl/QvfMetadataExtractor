@@ -186,6 +186,25 @@ wait_for_engine() {
   exit 1
 }
 
+verify_engine_tmp_mount() {
+  local probe_dir="$TMP_ROOT_ABS/.engine-probe"
+  local probe_file="$probe_dir/visibility.check"
+
+  mkdir -p "$probe_dir"
+  printf 'ok\n' > "$probe_file"
+
+  log "Verifying that the engine container can read the temp runtime path."
+  if docker_cmd exec "$ENGINE_CONTAINER_NAME" sh -lc "test -r '$probe_file'"; then
+    rm -f "$probe_file"
+    rmdir "$probe_dir" >/dev/null 2>&1 || true
+    log "Engine container can access the temp runtime path."
+    return
+  fi
+
+  log "Engine container cannot access $TMP_ROOT_ABS. Check the runtime mount configuration."
+  exit 1
+}
+
 start_web_app() {
   if [[ -f "$APP_PID_FILE" ]]; then
     local old_pid
@@ -207,6 +226,7 @@ start_web_app() {
     JOB_TTL_MINUTES="$JOB_TTL_MINUTES" \
     QLIK_BIN="$QLIK_BIN" \
     ENGINE_CONTAINER_NAME="$ENGINE_CONTAINER_NAME" \
+    KEEP_FAILED_JOBS="${KEEP_FAILED_JOBS:-false}" \
     node "$ROOT_DIR/server/index.js" >>"$APP_LOG_FILE" 2>&1 &
   echo $! > "$APP_PID_FILE"
 }
@@ -236,5 +256,6 @@ install_qlik_cli
 pull_engine_image
 start_engine
 wait_for_engine
+verify_engine_tmp_mount
 start_web_app
 show_summary

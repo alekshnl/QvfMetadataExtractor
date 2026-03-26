@@ -26,6 +26,7 @@ const engineUrl = process.env.ENGINE_URL || '127.0.0.1:9076';
 const qlikBin = path.resolve(rootDir, process.env.QLIK_BIN || './bin/qlik');
 const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 512);
 const jobTtlMinutes = Number(process.env.JOB_TTL_MINUTES || 30);
+const keepFailedJobs = String(process.env.KEEP_FAILED_JOBS || 'false').toLowerCase() === 'true';
 const uploadLimitBytes = maxUploadMb * 1024 * 1024;
 
 let activeJobId = null;
@@ -92,6 +93,15 @@ async function cleanupExpiredJobs() {
         }
       })
   );
+}
+
+async function writeFailureReport(jobDir, details) {
+  const reportPath = path.join(jobDir, 'failure-report.txt');
+  const lines = Object.entries(details)
+    .filter(([, value]) => value !== null && value !== undefined && value !== '')
+    .map(([key, value]) => `${key}: ${value}`);
+
+  await fsp.writeFile(reportPath, `${lines.join('\n')}\n`, 'utf8');
 }
 
 async function runQlik(args) {
@@ -195,6 +205,10 @@ async function prepareJobDirectories(paths) {
   ]);
 }
 
+async function assertReadableFile(filePath) {
+  await fsp.access(filePath, fs.constants.R_OK);
+}
+
 async function removeImportedApp(appId) {
   if (!appId) return;
   try {
@@ -256,12 +270,14 @@ app.post('/api/extract', uploadMiddleware, async (req, res) => {
   const appName = `${paths.baseName}-${jobId.slice(0, 8)}`;
   let appId = null;
   let lastQlikArgs = null;
+  let failed = false;
 
   activeJobId = jobId;
 
   try {
     await prepareJobDirectories(paths);
     await fsp.rename(req.file.path, paths.uploadedFile);
+    await assertReadableFile(paths.uploadedFile);
 
     lastQlikArgs = buildEngineArgs(['app', 'import', '--quiet', '--name', appName, '--file', paths.uploadedFile]);
     const importResult = await runQlik(lastQlikArgs);
@@ -275,17 +291,37 @@ app.post('/api/extract', uploadMiddleware, async (req, res) => {
     await zipDirectory(paths.extractDir, paths.zipPath);
     await sendDownload(res, paths.zipPath, path.basename(paths.zipPath));
   } catch (error) {
+    failed = true;
+    const details = explainQlikError(error, lastQlikArgs || []);
+
+    if (keepFailedJobs) {
+      await writeFailureReport(paths.jobDir, {
+        jobId,
+        uploadedFile: paths.uploadedFile,
+        extractDir: paths.extractDir,
+        zipPath: paths.zipPath,
+        appId,
+        qlikCommand: (lastQlikArgs || []).join(' '),
+        details,
+      }).catch((reportError) => {
+        console.error('Failed to write failure report:', reportError);
+      });
+    }
+
     console.error(error);
     if (!res.headersSent) {
       res.status(500).json({
         error: 'The QVF file could not be processed.',
-        details: explainQlikError(error, lastQlikArgs || []),
+        details,
+        jobId: keepFailedJobs ? jobId : undefined,
       });
     }
   } finally {
     await removeImportedApp(appId);
     await safeUnlink(req.file?.path);
-    await safeRm(paths.jobDir);
+    if (!(failed && keepFailedJobs)) {
+      await safeRm(paths.jobDir);
+    }
     activeJobId = null;
   }
 });
