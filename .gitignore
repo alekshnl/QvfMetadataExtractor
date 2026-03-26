@@ -1,0 +1,6 @@
+node_modules/
+runtime/
+artifacts/*.tar
+artifacts/*.txt
+.env
+.DS_Store
