@@ -893,7 +893,10 @@ def discover_index_vectors(
 
 
 def build_block_index(
-    format_blocks: list[dict[str, Any]], blob: bytes
+    format_blocks: list[dict[str, Any]],
+    blob: bytes,
+    *,
+    include_zlib_streams: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     known_ranges = [(block["payload_offset"], block["payload_end"]) for block in format_blocks]
     block_rows: list[dict[str, Any]] = []
@@ -927,17 +930,18 @@ def build_block_index(
                 }
             )
 
-    for stream in iter_unique_zlib_streams(blob, known_ranges):
-        block_rows.append(
-            {
-                "block_type": "zlib_stream",
-                "offset": stream["offset"],
-                "compressed_size": stream["compressed_size"],
-                "decompressed_size": stream["decompressed_size"],
-                "within_known_payload": stream["within_known_payload"],
-                "preview": stream["output"][:120].decode("utf-8", errors="ignore"),
-            }
-        )
+    if include_zlib_streams:
+        for stream in iter_unique_zlib_streams(blob, known_ranges):
+            block_rows.append(
+                {
+                    "block_type": "zlib_stream",
+                    "offset": stream["offset"],
+                    "compressed_size": stream["compressed_size"],
+                    "decompressed_size": stream["decompressed_size"],
+                    "within_known_payload": stream["within_known_payload"],
+                    "preview": stream["output"][:120].decode("utf-8", errors="ignore"),
+                }
+            )
 
     return block_rows, opaque_rows
 
@@ -2562,15 +2566,24 @@ def main() -> int:
     blob = input_path.read_bytes()
     format_blocks, decoded_objects = decode_format_blocks(blob)
     summary = summarise_objects(decoded_objects)
-    strings = extract_strings(blob)
     assets, binary_unknowns = extract_binary_assets(blob, format_blocks, assets_dir)
-    scalar_streams = discover_scalar_streams(blob, format_blocks)
+    if args.skip_tables:
+        strings: list[str] = []
+        scalar_streams: list[dict[str, Any]] = []
+        table_specs: list[dict[str, Any]] = []
+        non_scalar_streams: list[dict[str, Any]] = []
+        index_vectors: list[dict[str, Any]] = []
+        block_rows, opaque_rows = build_block_index(format_blocks, blob, include_zlib_streams=False)
+    else:
+        strings = extract_strings(blob)
+        scalar_streams = discover_scalar_streams(blob, format_blocks)
+        table_specs = build_table_specs(summary["data_model_metadata"])
+        non_scalar_streams = classify_non_scalar_streams(blob, format_blocks, table_specs)
+        index_vectors = discover_index_vectors(blob, format_blocks, table_specs)
+        block_rows, opaque_rows = build_block_index(format_blocks, blob, include_zlib_streams=True)
+
     data_sources = collect_data_sources(summary["script"], strings)
-    block_rows, opaque_rows = build_block_index(format_blocks, blob)
     opaque_rows.extend(binary_unknowns)
-    table_specs = build_table_specs(summary["data_model_metadata"])
-    non_scalar_streams = classify_non_scalar_streams(blob, format_blocks, table_specs)
-    index_vectors = discover_index_vectors(blob, format_blocks, table_specs)
 
     temporal_hints = parse_temporal_format_hints(summary["script"])
 
@@ -2636,39 +2649,41 @@ def main() -> int:
     jsonl_dump(raw_dir / "blocks.jsonl", block_rows)
     jsonl_dump(raw_dir / "decoded-objects.jsonl", decoded_objects)
     json_dump(raw_dir / "unknown-blocks.json", opaque_rows)
-    json_dump(raw_dir / "non-scalar-streams.json", non_scalar_streams)
-    json_dump(raw_dir / "index-vectors.json", [
-        {
-            "offset": vector["offset"],
-            "table": vector["table"],
-            "row_count": vector["row_count"],
-            "bits_per_value": vector["bits_per_value"],
-            "header_bytes": vector["header_bytes"],
-            "min": vector["min"],
-            "max": vector["max"],
-            "unique_count": vector["unique_count"],
-            "best_cardinality": vector["best_cardinality"],
-            "best_distance": vector["best_distance"],
-        }
-        for vector in index_vectors
-    ])
-    json_dump(raw_dir / "scalar-streams.json", [
-        {
-            "offset": stream["offset"],
-            "count": stream["count"],
-            "value_type": stream["value_type"],
-            "traits": stream["traits"],
-            "head": stream["values"][:10],
-            "tail": stream["values"][-10:],
-        }
-        for stream in scalar_streams
-    ])
+    if not args.skip_tables:
+        json_dump(raw_dir / "non-scalar-streams.json", non_scalar_streams)
+        json_dump(raw_dir / "index-vectors.json", [
+            {
+                "offset": vector["offset"],
+                "table": vector["table"],
+                "row_count": vector["row_count"],
+                "bits_per_value": vector["bits_per_value"],
+                "header_bytes": vector["header_bytes"],
+                "min": vector["min"],
+                "max": vector["max"],
+                "unique_count": vector["unique_count"],
+                "best_cardinality": vector["best_cardinality"],
+                "best_distance": vector["best_distance"],
+            }
+            for vector in index_vectors
+        ])
+        json_dump(raw_dir / "scalar-streams.json", [
+            {
+                "offset": stream["offset"],
+                "count": stream["count"],
+                "value_type": stream["value_type"],
+                "traits": stream["traits"],
+                "head": stream["values"][:10],
+                "tail": stream["values"][-10:],
+            }
+            for stream in scalar_streams
+        ])
     if not args.skip_tables:
         write_table_outputs(output_dir, table_payload, temporal_hints)
         json_dump(output_dir / "tables" / "_manifest.json", table_manifest)
         json_dump(output_dir / "tables" / "_confidence.json", table_confidence)
         json_dump(raw_dir / "table-block-mapping.json", table_mapping)
-    (raw_dir / "string-findings.txt").write_text("\n".join(strings) + "\n", encoding="utf-8")
+    if not args.skip_tables:
+        (raw_dir / "string-findings.txt").write_text("\n".join(strings) + "\n", encoding="utf-8")
 
     manifest["generated_files"] = sorted(
         str(path.relative_to(output_dir)) for path in output_dir.rglob("*") if path.is_file()

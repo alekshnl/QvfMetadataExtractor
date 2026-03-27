@@ -3,40 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>QVF Metadata And Table Extractor</title>
+    <title>QVF Discovery Workspace</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+    />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <section class="tool panel">
-        <div class="tool-header">
-          <p class="eyebrow">QVF Extractor</p>
-          <h1>Extract metadata from a QVF file.</h1>
-          <p class="lede">Upload a file, choose whether table exports should be included, and download a ZIP result.</p>
-        </div>
-        <form id="upload-form" class="upload-card" novalidate>
-          <label class="upload-label" for="qvf-file">QVF file</label>
-          <input id="qvf-file" name="qvf" type="file" accept=".qvf" required />
-          <label class="toggle" for="include-tables">
-            <input id="include-tables" name="includeTables" type="checkbox" value="true" checked />
-            <span>Include data tables in the ZIP</span>
-          </label>
-          <p class="upload-hint">Supports <strong>.qvf</strong> input and returns a ZIP download.</p>
-          <button id="submit-button" type="submit">Extract metadata and tables</button>
-          <div id="status" class="status idle" aria-live="polite">Ready for upload</div>
-          <p id="error-message" class="error-message" hidden></p>
-        </form>
-      </section>
-
-      <section class="note panel">
-        <h2>Process</h2>
-        <p>
-          The uploaded file is processed in a temporary folder, the ZIP is returned to your browser, and the temporary
-          files are removed after processing. The load script is included as <code>script.qvs</code>.
-        </p>
-      </section>
-    </main>
-
+    <div id="app"></div>
     <script src="/app.js" defer></script>
   </body>
 </html>

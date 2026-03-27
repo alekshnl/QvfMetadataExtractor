@@ -1,12 +1,13 @@
 # QVF Metadata And Table Extractor
 
-🧩 A focused utility for reading Qlik `.qvf` files directly and packaging the discovered metadata and reconstructed tables into a downloadable ZIP archive.
+🧩 A focused utility for reading Qlik `.qvf` files directly, surfacing discoveries in a browser workspace, and packaging the discovered metadata and reconstructed tables into a downloadable ZIP archive.
 
 The project now follows a host-native approach:
 
 - upload a `.qvf` file through the web UI
 - analyze the file with a Python extractor
-- download the extracted metadata package
+- inspect discoveries in a tabbed browser workspace
+- download the extracted metadata package when needed
 - remove the temporary upload and job folder afterward
 
 No Qlik runtime, Docker container, or external engine is required for the extraction path.
@@ -53,8 +54,9 @@ When a `.qvf` file is uploaded, the application performs the following workflow:
 5. The load script is extracted and saved as `script.qvs`.
 6. Reconstructed tables are written as `Parquet` and `TSV`, with confidence markers and source-block provenance.
 7. Embedded media items are exported when they can be cleanly bounded.
-8. A ZIP archive is created and returned to the browser.
-9. After processing, the uploaded file and temporary extraction folder are removed.
+8. The Node.js layer builds a UI-ready analysis payload around the extractor output.
+9. The browser renders the tabbed analysis workspace and can fetch the ZIP separately.
+10. Temporary job folders remain available until the configured TTL expires.
 
 Version 1 processes one upload at a time. If another extraction is already running, the service returns a busy response instead of running jobs in parallel.
 
@@ -83,14 +85,34 @@ The web interface is available on:
 
 - `http://<server-ip>:5165`
 
-The page is intentionally compact and task-oriented. It includes:
+The page now focuses on discovery first. It includes:
 
-- a `.qvf` file input
-- a primary action to start extraction
-- live upload and processing status
-- an English explanation of the file lifecycle
-- an English summary of the runtime components
-- output that now includes reconstructed tables and confidence reports
+- an empty-state upload workspace
+- a primary action to analyze a `.qvf`
+- a multi-tab analysis view with overview, structure, design, tables, script, and assets
+- live processing status and error states
+- a secondary ZIP download action tied to the active analysis job
+- support for keeping multiple analysis jobs in browser state for future compare workflows
+
+## 🔌 Web API
+
+Primary routes:
+
+- `POST /api/analyze`
+  - uploads a `.qvf`
+  - runs the extractor
+  - returns JSON with `jobId`, `appLabel`, `downloadUrl`, and `analysis`
+- `GET /api/jobs/:jobId/analysis`
+  - reloads a saved analysis while the job is still inside TTL
+- `GET /api/jobs/:jobId/download`
+  - downloads the ZIP package for a saved analysis job
+- `GET /api/jobs/:jobId/assets/:filename`
+  - serves extracted assets used by the analysis workspace
+
+Compatibility route:
+
+- `POST /api/extract`
+  - keeps the older ZIP-only workflow intact
 
 ## 🐍 Running The Extractor Directly
 
@@ -166,16 +188,15 @@ EXTRACTOR_SCRIPT=./scripts/extract_qvf.py
 KEEP_FAILED_JOBS=false
 ```
 
+If `PYTHON_BIN` is not set, the server prefers `./.venv/bin/python` when it exists and falls back to `python3` otherwise.
+
 The Python dependency list lives in `requirements.txt`. The current extractor uses `pyarrow` for Parquet output.
 
 ## 🗂️ Temporary Data And Cleanup
 
 Runtime data is stored under `runtime/` and is not meant for source control.
 
-Cleanup happens in two ways:
-
-- immediately after a successful extraction
-- automatically for stale job folders older than the configured TTL
+Cleanup happens automatically for stale job folders older than the configured TTL.
 
 If you need to inspect a failed run, set:
 
@@ -217,6 +238,7 @@ This repository provides a controlled way to:
 
 - upload a Qlik app
 - decode as much metadata as possible directly from the `.qvf`
+- inspect discoveries in a browser workspace before downloading raw output
 - keep the load script as a real `.qvs` file
 - export reconstructed model tables as `Parquet` and `TSV`
 - tell you which table columns are exact, heuristic, partial, or still missing
